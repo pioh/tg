@@ -14,12 +14,9 @@
 // Хранилище: data/monitors.json. Состояние (курсор/время срабатывания) живёт там же.
 
 import type { TelegramClient, Message } from "@mtcute/bun";
-import { DATA_DIR } from "./paths.ts";
-import { join } from "node:path";
+import { monitorsPath } from "./paths.ts";
 import { atomicWriteJson } from "./atomic.ts";
 import { messageLite, type MessageLite } from "../telegram/ops.ts";
-
-const MONITORS_PATH = join(DATA_DIR, "monitors.json");
 
 export type MonitorAction = "notify" | "draft" | "reply";
 
@@ -78,7 +75,7 @@ function normalizeMonitor(raw: any): Monitor | null {
 }
 
 async function load(): Promise<MonitorsFile> {
-  const f = Bun.file(MONITORS_PATH);
+  const f = Bun.file(monitorsPath());
   if (!(await f.exists())) return { monitors: [] };
   try {
     const raw = (await f.json()) as Partial<MonitorsFile>;
@@ -90,7 +87,7 @@ async function load(): Promise<MonitorsFile> {
 }
 
 async function save(data: MonitorsFile): Promise<void> {
-  await atomicWriteJson(MONITORS_PATH, data);
+  await atomicWriteJson(monitorsPath(), data);
 }
 
 function newId(existing: Monitor[]): string {

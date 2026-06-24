@@ -1,68 +1,95 @@
 // Единая карта путей проекта. Кросс-платформенно (mac/windows/linux) — все пути
 // строятся от корня репозитория, вычисленного относительно этого файла.
 //
-// ВАЖНО: жёсткое разделение, которое требует ТЗ:
-//   - src/   — исходный код (этот файл лежит в src/lib/, корень = ../..)
-//   - data/  — рабочая папка агента: сессия, правила-оверрайды, QA, память,
-//              handoff и progress. Полностью игнорируется git (личные данные).
+// МУЛЬТИТЕНАНТНОСТЬ. Один сервис обслуживает НЕСКОЛЬКО независимых пользователей
+// («тенантов»): у каждого своя рабочая папка (со своей сессией Telegram, ботом,
+// памятью, правилами, мониторами и т.д.). Папки лежат в TENANTS_DIR (tenants/<имя>).
 //
-// data-папку можно переопределить переменной окружения TG_DATA_DIR.
+// Чтобы не тащить путь тенанта руками через каждую функцию, текущий тенант хранится в
+// AsyncLocalStorage (tenantStore): сервис оборачивает обработку каждого тенанта в
+// tenantStore.run(ctx, …), и все path-функции ниже отдают пути ЕГО папки. Вне контекста
+// тенанта (CLI/тесты/одиночные команды) путь берётся из TG_DATA_DIR, иначе — <repo>/data
+// (legacy single-tenant). Это единственное «по умолчанию» и только для инструментов.
+//
+// ВАЖНО: жёсткое разделение src/ (код) и рабочих папок (личные данные, не в git).
 
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // src/lib/paths.ts -> корень репозитория на два уровня выше.
 export const REPO_ROOT: string = resolve(import.meta.dir, "..", "..");
 
-// Базовые (универсальные, коммитятся в git) промпты-правила.
+// Базовые (универсальные, коммитятся в git) промпты-правила — общие для всех тенантов.
 export const RULES_DIR: string = resolve(REPO_ROOT, "rules");
 
-// Рабочая папка. По умолчанию <repo>/data, можно переопределить TG_DATA_DIR.
-export const DATA_DIR: string = process.env.TG_DATA_DIR
-  ? resolve(process.env.TG_DATA_DIR)
-  : resolve(REPO_ROOT, "data");
-
-// Пользовательские оверрайды правил (тот же basename переопределяет базовый).
-export const DATA_RULES_DIR: string = resolve(DATA_DIR, "rules");
-
-// Хранилище Telegram-сессии (bun:sqlite). Файл получит суффикс .session.
-export const SESSION_DIR: string = resolve(DATA_DIR, "session");
-export const SESSION_PATH: string = resolve(SESSION_DIR, "account");
-
-// Дословные просьбы человека к агенту: data/qa/<YYYY-MM-DD>.md
-export const QA_DIR: string = resolve(DATA_DIR, "qa");
-
-// Долговременная структурированная память (люди, чаты, факты, договорённости).
-export const MEMORY_DIR: string = resolve(DATA_DIR, "memory");
-
-// Скачанные из Telegram файлы.
-export const DOWNLOADS_DIR: string = resolve(DATA_DIR, "downloads");
-
-// Актуальный статус (handoff), который читает каждый следующий агент.
-export const HANDOFF_PATH: string = resolve(DATA_DIR, "handoff.md");
-
-// Append-only журнал значимых действий/достижений.
-export const PROGRESS_PATH: string = resolve(DATA_DIR, "progress.txt");
-
-// Прозрачный журнал ВСЕХ действий агента через MCP (кто/что/кому). Пишет сервер,
-// читает сервис и выводит в свою консоль. Технический аудит-лог.
-export const ACTIONS_PATH: string = resolve(DATA_DIR, "actions.log");
-
-// Полная переписка человека с сервисным ботом (вход и ответы) — на диске, чтобы
-// любой следующий агент знал контекст разговора.
-export const BOT_CHAT_PATH: string = resolve(DATA_DIR, "bot-chat.md");
-
-// Внутреннее состояние сервиса (курсоры опроса и т.п.).
-export const STATE_PATH: string = resolve(DATA_DIR, "state.json");
-
-// Личная конфигурация (api_id/api_hash, выбор движка и пр.). Не коммитится.
-export const CONFIG_PATH: string = resolve(DATA_DIR, "config.json");
-
-// Code-level allowlist отправки сообщений (кому агент может писать). Не коммитится.
-export const PERMISSIONS_PATH: string = resolve(DATA_DIR, "permissions.json");
-
-// Lock + рантайм-координаты запущенного сервиса (pid, порт хаба, bearer-токен RPC).
-// Гарантирует «один сервис — один владелец сессии» и даёт MCP-прокси найти хаб.
-export const LOCK_PATH: string = resolve(DATA_DIR, "service.lock");
+// Корень рабочих папок тенантов (по умолчанию <repo>/tenants, можно переопределить).
+export const TENANTS_DIR: string = process.env.TG_TENANTS_DIR
+  ? resolve(process.env.TG_TENANTS_DIR)
+  : resolve(REPO_ROOT, "tenants");
 
 // Путь к MCP-серверу — используется при программном запуске движка.
 export const MCP_SERVER_PATH: string = resolve(REPO_ROOT, "src", "mcp", "server.ts");
+
+export interface TenantContext {
+  /** имя тенанта (= имя папки в tenants/). */
+  name: string;
+  /** абсолютный путь рабочей папки тенанта. */
+  dataDir: string;
+  /** порт RPC-хаба этого тенанта. */
+  hubPort: number;
+}
+
+/** Контекст текущего тенанта (см. описание модуля). */
+export const tenantStore = new AsyncLocalStorage<TenantContext>();
+
+/** Рабочая папка ТЕКУЩЕГО тенанта (или legacy data/ вне контекста тенанта). */
+export function dataDir(): string {
+  const ctx = tenantStore.getStore();
+  if (ctx) return ctx.dataDir;
+  return process.env.TG_DATA_DIR ? resolve(process.env.TG_DATA_DIR) : resolve(REPO_ROOT, "data");
+}
+
+/** Имя текущего тенанта, если есть контекст. */
+export function currentTenant(): TenantContext | undefined {
+  return tenantStore.getStore();
+}
+
+/** Папка тенанта по имени (без активации контекста). */
+export function tenantDir(name: string): string {
+  return join(TENANTS_DIR, name);
+}
+
+// --- Пути внутри рабочей папки текущего тенанта (функции, т.к. зависят от контекста) ---
+
+// Пользовательские оверрайды правил (тот же basename переопределяет базовый).
+export const dataRulesDir = (): string => join(dataDir(), "rules");
+// Хранилище Telegram-сессии (bun:sqlite). Файл получит суффикс .session.
+export const sessionDir = (): string => join(dataDir(), "session");
+export const sessionPath = (): string => join(sessionDir(), "account");
+// Дословные просьбы человека: <data>/qa/<YYYY-MM-DD>.md
+export const qaDir = (): string => join(dataDir(), "qa");
+// Долговременная структурированная память.
+export const memoryDir = (): string => join(dataDir(), "memory");
+// Скачанные из Telegram файлы.
+export const downloadsDir = (): string => join(dataDir(), "downloads");
+// Актуальный статус (handoff), который читает каждый следующий агент.
+export const handoffPath = (): string => join(dataDir(), "handoff.md");
+// Append-only журнал значимых действий/достижений.
+export const progressPath = (): string => join(dataDir(), "progress.txt");
+// Прозрачный журнал ВСЕХ действий агента через MCP (кто/что/кому).
+export const actionsPath = (): string => join(dataDir(), "actions.log");
+// Полная переписка человека с сервисным ботом (вход и ответы) — на диске.
+export const botChatPath = (): string => join(dataDir(), "bot-chat.md");
+// Внутреннее состояние сервиса (курсоры опроса и т.п.).
+export const statePath = (): string => join(dataDir(), "state.json");
+// Личная конфигурация (api_id/api_hash, выбор движка и пр.). Не коммитится.
+export const configPath = (): string => join(dataDir(), "config.json");
+// Code-level allowlist отправки сообщений (кому агент может писать). Не коммитится.
+export const permissionsPath = (): string => join(dataDir(), "permissions.json");
+// Кто может писать сервисному боту (allowlist; по умолчанию только владелец).
+export const botUsersPath = (): string => join(dataDir(), "bot-users.json");
+// Мониторы и расписания тенанта.
+export const monitorsPath = (): string => join(dataDir(), "monitors.json");
+export const schedulesPath = (): string => join(dataDir(), "schedules.json");
+// Lock + рантайм-координаты сервиса тенанта (pid, порт хаба, bearer-токен RPC).
+export const lockPath = (): string => join(dataDir(), "service.lock");

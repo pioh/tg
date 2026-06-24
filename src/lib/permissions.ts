@@ -9,7 +9,7 @@
 //
 // Хранилище: data/permissions.json (ключ — числовой peerId). Не коммитится.
 
-import { PERMISSIONS_PATH } from "./paths.ts";
+import { permissionsPath } from "./paths.ts";
 import { atomicWriteJson } from "./atomic.ts";
 
 export type SendMode = "reply"; // пока единственный режим разрешённой отправки
@@ -26,7 +26,7 @@ interface PermissionsFile {
 }
 
 async function load(): Promise<PermissionsFile> {
-  const f = Bun.file(PERMISSIONS_PATH);
+  const f = Bun.file(permissionsPath());
   if (!(await f.exists())) return { chats: {} };
   try {
     const raw = (await f.json()) as Partial<PermissionsFile>;
@@ -37,7 +37,7 @@ async function load(): Promise<PermissionsFile> {
 }
 
 async function save(data: PermissionsFile): Promise<void> {
-  await atomicWriteJson(PERMISSIONS_PATH, data);
+  await atomicWriteJson(permissionsPath(), data);
 }
 
 export async function listPermissions(): Promise<Record<string, ChatPermission>> {

@@ -1,10 +1,10 @@
 import "./_env.ts";
 import { test, expect } from "bun:test";
 import { join } from "node:path";
-import { DATA_DIR } from "../src/lib/paths.ts";
+import { dataDir } from "../src/lib/paths.ts";
 import { listMonitors, updateMonitor } from "../src/lib/monitors.ts";
 
-const MON_PATH = join(DATA_DIR, "monitors.json");
+const MON_PATH = join(dataDir(), "monitors.json");
 
 test("миграция: монитор без enabled/action чинится (включён, notify)", async () => {
   // Воспроизводим старый баг: запись без обязательных полей.

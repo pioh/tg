@@ -16,8 +16,9 @@ import type { SentCode, User } from "@mtcute/bun";
 import qrcode from "qrcode-terminal";
 import { mkdir } from "node:fs/promises";
 import { requireConfig } from "./lib/config.ts";
-import { SESSION_DIR, SESSION_PATH } from "./lib/paths.ts";
+import { sessionDir, sessionPath } from "./lib/paths.ts";
 import { ensureDataLayout } from "./lib/memory.ts";
+import { createTenant, tenantContext, tenantExists, withTenant } from "./lib/tenants.ts";
 
 function ask(question: string): string {
   const ans = prompt(question);
@@ -199,12 +200,12 @@ async function loginByQr(tg: TelegramClient): Promise<User> {
   });
 }
 
-async function main(): Promise<void> {
+async function run(): Promise<void> {
   await ensureDataLayout();
-  await mkdir(SESSION_DIR, { recursive: true });
+  await mkdir(sessionDir(), { recursive: true });
 
   const cfg = await requireConfig();
-  const tg = new TelegramClient({ apiId: cfg.apiId, apiHash: cfg.apiHash, storage: SESSION_PATH });
+  const tg = new TelegramClient({ apiId: cfg.apiId, apiHash: cfg.apiHash, storage: sessionPath() });
   await tg.connect();
 
   // Уже залогинены?
@@ -220,10 +221,23 @@ async function main(): Promise<void> {
   const user = useCode ? await loginByCode(tg) : await loginByQr(tg);
 
   console.log(`\n✅ Вход выполнен: ${user.displayName}${user.username ? ` (@${user.username})` : ""}`);
-  console.log("Сессия сохранена. Теперь можно запускать `bun run service`.\n");
+  console.log("Сессия сохранена.\n");
 
   await tg.destroy();
   process.exit(0);
+}
+
+// Вход в КОНКРЕТНОГО тенанта: первый не-флаговый аргумент — имя тенанта (его сессия
+// ляжет в tenants/<имя>/). Без имени — legacy-папка data/ (TG_DATA_DIR).
+async function main(): Promise<void> {
+  const name = process.argv.slice(2).find((a) => !a.startsWith("-"));
+  if (name) {
+    if (!(await tenantExists(name))) await createTenant(name);
+    console.log(`Вход в тенанта «${name}».`);
+    await withTenant(tenantContext(name, 0), run);
+  } else {
+    await run();
+  }
 }
 
 main().catch((err) => {

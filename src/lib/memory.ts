@@ -13,16 +13,16 @@
 import { appendFile, mkdir, open, readdir, readFile, stat } from "node:fs/promises";
 import { join, basename } from "node:path";
 import {
-  BOT_CHAT_PATH,
-  DATA_DIR,
-  DATA_RULES_DIR,
-  DOWNLOADS_DIR,
-  HANDOFF_PATH,
-  MEMORY_DIR,
-  PROGRESS_PATH,
-  QA_DIR,
+  botChatPath,
+  dataDir,
+  dataRulesDir,
+  downloadsDir,
+  handoffPath,
+  memoryDir,
+  progressPath,
+  qaDir,
   RULES_DIR,
-  SESSION_DIR,
+  sessionDir,
 } from "./paths.ts";
 
 // ---------- утилиты дат ----------
@@ -81,21 +81,21 @@ const PROGRESS_SEED = `# progress.txt — append-only журнал значим�
 
 /** Создаёт все нужные папки и засевает базовые файлы, если их ещё нет. */
 export async function ensureDataLayout(): Promise<void> {
-  for (const d of [DATA_DIR, DATA_RULES_DIR, SESSION_DIR, QA_DIR, MEMORY_DIR, DOWNLOADS_DIR]) {
+  for (const d of [dataDir(), dataRulesDir(), sessionDir(), qaDir(), memoryDir(), downloadsDir()]) {
     await mkdir(d, { recursive: true });
   }
-  if (!(await exists(HANDOFF_PATH))) await Bun.write(HANDOFF_PATH, HANDOFF_SEED);
-  if (!(await exists(PROGRESS_PATH))) await Bun.write(PROGRESS_PATH, PROGRESS_SEED);
+  if (!(await exists(handoffPath()))) await Bun.write(handoffPath(), HANDOFF_SEED);
+  if (!(await exists(progressPath()))) await Bun.write(progressPath(), PROGRESS_SEED);
 }
 
 // ---------- handoff ----------
 
 export async function readHandoff(): Promise<string> {
-  return readText(HANDOFF_PATH);
+  return readText(handoffPath());
 }
 export async function writeHandoff(content: string): Promise<void> {
-  await mkdir(DATA_DIR, { recursive: true });
-  await Bun.write(HANDOFF_PATH, content.endsWith("\n") ? content : content + "\n");
+  await mkdir(dataDir(), { recursive: true });
+  await Bun.write(handoffPath(), content.endsWith("\n") ? content : content + "\n");
 }
 
 // ---------- progress ----------
@@ -120,14 +120,14 @@ async function seedOnce(path: string, seed: string): Promise<void> {
 }
 
 export async function appendProgress(line: string): Promise<void> {
-  await mkdir(DATA_DIR, { recursive: true });
-  await seedOnce(PROGRESS_PATH, PROGRESS_SEED);
+  await mkdir(dataDir(), { recursive: true });
+  await seedOnce(progressPath(), PROGRESS_SEED);
   const clean = line.replace(/\s+/g, " ").trim();
-  await appendFile(PROGRESS_PATH, `${stamp()}  ${clean}\n`, "utf8");
+  await appendFile(progressPath(), `${stamp()}  ${clean}\n`, "utf8");
 }
 
 export async function readProgressTail(lines = 40): Promise<string> {
-  const all = (await readText(PROGRESS_PATH)).split("\n").filter((l) => l.length > 0);
+  const all = (await readText(progressPath())).split("\n").filter((l) => l.length > 0);
   return all.slice(-lines).join("\n");
 }
 
@@ -138,8 +138,8 @@ export async function readProgressTail(lines = 40): Promise<string> {
  * source — откуда пришла просьба (например "telegram:me", "cli", "claude-code").
  */
 export async function recordQa(text: string, source = "unknown"): Promise<string> {
-  await mkdir(QA_DIR, { recursive: true });
-  const file = join(QA_DIR, `${today()}.md`);
+  await mkdir(qaDir(), { recursive: true });
+  const file = join(qaDir(), `${today()}.md`);
   await seedOnce(file, `# Просьбы человека — ${today()}\n\n`);
   const entry = `## ${stamp()} · ${source}\n\n${text.trim()}\n\n`;
   await appendFile(file, entry, "utf8");
@@ -148,14 +148,14 @@ export async function recordQa(text: string, source = "unknown"): Promise<string
 
 /** Возвращает содержимое QA за последние n дней (включая сегодня). */
 export async function readRecentQa(days = 3): Promise<string> {
-  if (!(await exists(QA_DIR))) return "";
-  const files = (await readdir(QA_DIR))
+  if (!(await exists(qaDir()))) return "";
+  const files = (await readdir(qaDir()))
     .filter((f) => f.endsWith(".md"))
     .sort();
   const recent = files.slice(-days);
   const parts: string[] = [];
   for (const f of recent) {
-    parts.push(`----- ${f} -----\n${await readText(join(QA_DIR, f))}`);
+    parts.push(`----- ${f} -----\n${await readText(join(qaDir(), f))}`);
   }
   return parts.join("\n\n");
 }
@@ -181,12 +181,12 @@ async function listMd(dir: string): Promise<string[]> {
  */
 export async function mergeRules(): Promise<MergedRule[]> {
   const baseFiles = await listMd(RULES_DIR);
-  const overrideFiles = new Set(await listMd(DATA_RULES_DIR));
+  const overrideFiles = new Set(await listMd(dataRulesDir()));
   const result: MergedRule[] = [];
 
   for (const name of baseFiles) {
     if (overrideFiles.has(name)) {
-      result.push({ name, source: "override", content: await readText(join(DATA_RULES_DIR, name)) });
+      result.push({ name, source: "override", content: await readText(join(dataRulesDir(), name)) });
       overrideFiles.delete(name);
     } else {
       result.push({ name, source: "base", content: await readText(join(RULES_DIR, name)) });
@@ -194,7 +194,7 @@ export async function mergeRules(): Promise<MergedRule[]> {
   }
   // оставшиеся файлы data/rules — чистые добавления
   for (const name of [...overrideFiles].sort()) {
-    result.push({ name, source: "custom", content: await readText(join(DATA_RULES_DIR, name)) });
+    result.push({ name, source: "custom", content: await readText(join(dataRulesDir(), name)) });
   }
   // Финальная сортировка по имени файла, чтобы кастомные правила (напр. 25-*.md)
   // вставали между базовыми (20-, 30-), как обещает контракт числовых префиксов.
@@ -212,9 +212,9 @@ export async function mergedRulesText(): Promise<string> {
 
 /** Записывает/переопределяет правило в data/rules/<name>. Базу в rules/ не трогаем. */
 export async function setRule(name: string, content: string): Promise<string> {
-  await mkdir(DATA_RULES_DIR, { recursive: true });
+  await mkdir(dataRulesDir(), { recursive: true });
   const safe = basename(name).endsWith(".md") ? basename(name) : `${basename(name)}.md`;
-  const path = join(DATA_RULES_DIR, safe);
+  const path = join(dataRulesDir(), safe);
   await Bun.write(path, content.endsWith("\n") ? content : content + "\n");
   return path;
 }
@@ -222,9 +222,9 @@ export async function setRule(name: string, content: string): Promise<string> {
 // ---------- долговременная память ----------
 
 export async function setMemory(name: string, content: string): Promise<string> {
-  await mkdir(MEMORY_DIR, { recursive: true });
+  await mkdir(memoryDir(), { recursive: true });
   const safe = basename(name).endsWith(".md") ? basename(name) : `${basename(name)}.md`;
-  const path = join(MEMORY_DIR, safe);
+  const path = join(memoryDir(), safe);
   await Bun.write(path, content.endsWith("\n") ? content : content + "\n");
   return path;
 }
@@ -232,7 +232,7 @@ export async function setMemory(name: string, content: string): Promise<string> 
 /** Полный текст одной заметки памяти по имени (basename защищает от traversal). */
 export async function getMemory(name: string): Promise<string | null> {
   const safe = basename(name).endsWith(".md") ? basename(name) : `${basename(name)}.md`;
-  const path = join(MEMORY_DIR, safe);
+  const path = join(memoryDir(), safe);
   if (!(await exists(path))) return null;
   return readText(path);
 }
@@ -241,10 +241,10 @@ export async function getMemory(name: string): Promise<string | null> {
 export async function searchMemory(query: string): Promise<{ name: string; snippet: string }[]> {
   const q = query.trim().toLowerCase();
   if (!q) return [];
-  const files = await listMd(MEMORY_DIR);
+  const files = await listMd(memoryDir());
   const hits: { name: string; snippet: string }[] = [];
   for (const f of files) {
-    const txt = await readText(join(MEMORY_DIR, f));
+    const txt = await readText(join(memoryDir(), f));
     const idx = txt.toLowerCase().indexOf(q);
     if (idx >= 0) {
       const start = Math.max(0, idx - 60);
@@ -256,11 +256,11 @@ export async function searchMemory(query: string): Promise<{ name: string; snipp
 
 /** Краткий индекс файлов памяти: имя + первая содержательная строка. */
 export async function memoryIndex(): Promise<string> {
-  const files = await listMd(MEMORY_DIR);
+  const files = await listMd(memoryDir());
   if (files.length === 0) return "(память пуста)";
   const parts: string[] = [];
   for (const f of files) {
-    const txt = await readText(join(MEMORY_DIR, f));
+    const txt = await readText(join(memoryDir(), f));
     const firstLine = txt.split("\n").find((l) => l.trim().length > 0) ?? "";
     parts.push(`- ${f}: ${firstLine.replace(/^#+\s*/, "").slice(0, 100)}`);
   }
@@ -271,7 +271,7 @@ export async function memoryIndex(): Promise<string> {
 
 /** Хвост переписки человека с сервисным ботом — чтобы другие агенты видели контекст. */
 export async function readBotChatTail(lines = 80): Promise<string> {
-  const all = (await readText(BOT_CHAT_PATH)).split("\n");
+  const all = (await readText(botChatPath())).split("\n");
   return all.slice(-lines).join("\n").trim();
 }
 

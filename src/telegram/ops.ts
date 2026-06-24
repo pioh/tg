@@ -6,7 +6,7 @@ import type { TelegramClient, Message, Peer } from "@mtcute/bun";
 import { InputMedia, FileLocation } from "@mtcute/bun";
 import { extname, join } from "node:path";
 import { mkdir } from "node:fs/promises";
-import { DOWNLOADS_DIR } from "../lib/paths.ts";
+import { downloadsDir } from "../lib/paths.ts";
 
 // chatId из MCP приходит строкой: "me"/"self", @username, username или числовой id.
 function coercePeer(chatId: string | number): string | number {
@@ -288,9 +288,9 @@ export async function getMedia(tg: TelegramClient, chatId: string, messageId: nu
   if (!(media instanceof FileLocation)) {
     throw new Error(`Это медиа (${(media as { type?: string }).type}) нельзя скачать.`);
   }
-  await mkdir(DOWNLOADS_DIR, { recursive: true });
+  await mkdir(downloadsDir(), { recursive: true });
   const ext = mediaExtension(media);
-  const path = join(DOWNLOADS_DIR, `${chatId.replace(/[^\w-]/g, "_")}_${messageId}${ext}`);
+  const path = join(downloadsDir(), `${chatId.replace(/[^\w-]/g, "_")}_${messageId}${ext}`);
   await tg.downloadToFile(path, media);
 
   const result: MediaResult = {

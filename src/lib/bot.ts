@@ -11,7 +11,7 @@ import { loadState, updateState } from "./state.ts";
 import { recordQa } from "./memory.ts";
 import { isBotUserAllowed } from "./botusers.ts";
 import { appendFile } from "node:fs/promises";
-import { BOT_CHAT_PATH } from "./paths.ts";
+import { botChatPath } from "./paths.ts";
 
 function stamp(): string {
   const d = new Date();
@@ -20,7 +20,7 @@ function stamp(): string {
 }
 // Вся переписка с ботом — на диск (для других агентов и истории).
 async function logBotChat(dir: string, text: string): Promise<void> {
-  await appendFile(BOT_CHAT_PATH, `## ${stamp()} · ${dir}\n${text}\n\n`, "utf8").catch(() => {});
+  await appendFile(botChatPath(), `## ${stamp()} · ${dir}\n${text}\n\n`, "utf8").catch(() => {});
 }
 
 // Лимит длины сообщения Telegram — 4096 символов. Бьём длинный текст на части по
@@ -113,6 +113,7 @@ const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: "users", description: "кто может писать боту" },
   { command: "allowuser", description: "разрешить писать боту: /allowuser <id|@user>" },
   { command: "denyuser", description: "запретить писать боту: /denyuser <id|@user>" },
+  { command: "here", description: "(в группе) сделать её общей — отвечаю всем" },
   { command: "version", description: "версия и проверка обновлений" },
   { command: "update", description: "обновить tg до последней версии" },
   { command: "restart", description: "перезапустить агента (если запущен сервисом)" },
@@ -139,12 +140,14 @@ export interface BotIncoming {
   fromId: number;
   fromUsername: string | null;
   chatId: number;
+  /** тип чата: "private" | "group" | "supergroup". */
+  chatType: string;
   text: string;
   /** true, если написал сам владелец аккаунта (а не разрешённый пользователь). */
   isOwner: boolean;
 }
 
-/** Тот, кто постучался боту, но не в списке разрешённых (для уведомления владельцу). */
+/** Тот, кто постучался боту в личке, но не в списке разрешённых (уведомить владельца). */
 export interface BotUnauthorized {
   fromId: number;
   fromUsername: string | null;
@@ -152,10 +155,13 @@ export interface BotUnauthorized {
 }
 
 /**
- * Забирает новые сообщения, присланные боту. Принимает сообщения ВЛАДЕЛЬЦА (ownerId)
- * и явно разрешённых пользователей (data/bot-users.json). Остальных — игнорирует и
- * возвращает в unauthorized (сервис уведомит владельца). Команды дословно пишет в
- * data/qa. Двигает offset getUpdates.
+ * Забирает новые сообщения боту. Принимает:
+ *  - в ЛИЧКЕ: владельца (ownerId) и разрешённых пользователей (data/bot-users.json);
+ *    остальных — в unauthorized (сервис уведомит владельца);
+ *  - в АССИСТЕНТ-ГРУППЕ (cfg.botGroupChatId, семья): ВСЕ сообщения владельца и
+ *    разрешённых участников (privacy-mode у бота должен быть выключен);
+ *  - в прочих группах: только команды владельца (чтобы работал /here для назначения
+ *    группы). Команды/сообщения дословно пишет в data/qa. Двигает offset getUpdates.
  */
 export async function botPoll(
   ownerId?: number,
@@ -171,23 +177,50 @@ export async function botPoll(
   const unauthorized: BotUnauthorized[] = [];
   let maxUpd = offset - 1;
   let ownerChat = cfg.botOwnerChatId;
+
   for (const u of updates) {
     maxUpd = Math.max(maxUpd, u.update_id);
     const m = u.message;
     if (!m || typeof m.text !== "string" || m.text.length === 0) continue;
-    if (m.chat?.type !== "private") continue; // бот работает только в личке (не в группах)
+    const chatType = m.chat?.type as string | undefined;
     const fromId = m.from?.id as number | undefined;
-    if (fromId == null) continue;
+    if (fromId == null || !chatType) continue;
     const isOwner = ownerId == null || fromId === ownerId;
-    if (!isOwner && !(await isBotUserAllowed(fromId))) {
-      unauthorized.push({ fromId, fromUsername: m.from?.username ?? null, chatId: m.chat.id });
-      continue; // не владелец и не в allowlist — игнорируем
+    const isCmd = m.text.startsWith("/");
+    const allowedMember = isOwner || (await isBotUserAllowed(fromId));
+
+    if (chatType === "private") {
+      if (!allowedMember) {
+        unauthorized.push({ fromId, fromUsername: m.from?.username ?? null, chatId: m.chat.id });
+        continue;
+      }
+      if (isOwner) ownerChat = m.chat.id; // личка владельца для проактивных сообщений
+    } else if (chatType === "group" || chatType === "supergroup") {
+      const isAssistantGroup = cfg.botGroupChatId != null && m.chat.id === cfg.botGroupChatId;
+      if (isAssistantGroup) {
+        if (!allowedMember) continue; // в группе чужих игнорируем тихо (без уведомлений)
+      } else {
+        // не назначенная группа: принимаем только команды владельца (для /here).
+        if (!isOwner || !isCmd) continue;
+      }
+    } else {
+      continue; // каналы и пр. — игнор
     }
-    if (isOwner) ownerChat = m.chat.id; // chat владельца для проактивных сообщений бота
+
     await recordQa(m.text, `bot:${m.from?.username ?? fromId}`);
     await logBotChat(isOwner ? "👤 человек" : `👥 ${m.from?.username ?? fromId}`, m.text);
-    out.push({ updateId: u.update_id, messageId: m.message_id, fromId, fromUsername: m.from?.username ?? null, chatId: m.chat.id, text: m.text, isOwner });
+    out.push({
+      updateId: u.update_id,
+      messageId: m.message_id,
+      fromId,
+      fromUsername: m.from?.username ?? null,
+      chatId: m.chat.id,
+      chatType,
+      text: m.text,
+      isOwner,
+    });
   }
+
   if (maxUpd >= offset) {
     await updateState((s) => {
       s.botUpdateOffset = maxUpd + 1;

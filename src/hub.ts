@@ -6,7 +6,7 @@ import type { TelegramClient } from "@mtcute/bun";
 import { appendFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { HUB_PORT } from "./lib/rpc.ts";
-import { ACTIONS_PATH, CONFIG_PATH, LOCK_PATH, PERMISSIONS_PATH, SESSION_DIR, STATE_PATH } from "./lib/paths.ts";
+import { actionsPath, configPath, lockPath, permissionsPath, sessionDir, statePath, tenantStore, type TenantContext } from "./lib/paths.ts";
 import { log } from "./lib/log.ts";
 import { loadConfig } from "./lib/config.ts";
 import { loadState, updateState, type AgentUsage } from "./lib/state.ts";
@@ -57,7 +57,7 @@ function logAction(op: string, args: unknown, status: string): void {
   // Секреты (токен/api_hash/телефон/коды) маскируются перед записью.
   const line = `${tsNow()}  ${op}  ${redactToString(args)} → ${status}`;
   log("ACTION", line);
-  appendFile(ACTIONS_PATH, line + "\n", "utf8").catch(() => {});
+  appendFile(actionsPath(), line + "\n", "utf8").catch(() => {});
 }
 
 // Сериализуем bot getUpdates (Telegram допускает только один getUpdates за раз).
@@ -120,9 +120,9 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
   // Нельзя отправлять чувствительные файлы (сессия, конфиг, .env, разрешения, lock).
   function assertSafeFile(path: string): void {
     const abs = resolve(path);
-    const blocked = [CONFIG_PATH, STATE_PATH, LOCK_PATH, PERMISSIONS_PATH];
+    const blocked = [configPath(), statePath(), lockPath(), permissionsPath()];
     const denied =
-      abs.startsWith(SESSION_DIR) ||
+      abs.startsWith(sessionDir()) ||
       abs.endsWith(".session") ||
       abs.endsWith(".env") ||
       blocked.some((b) => abs === b);
@@ -319,8 +319,13 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
  * Поднимает HTTP-RPC на localhost. Требует bearer-токен на /rpc (см. lib/lock.ts):
  * без него любой локальный процесс мог бы дёрнуть send_message/bot_send и т.п.
  * /health — без авторизации (для health-check). Возвращает объект сервера Bun.
+ *
+ * ctx (мультитенант): если передан, каждый вызов хендлера исполняется в контексте
+ * тенанта (tenantStore.run) — чтобы пути/состояние указывали на ЕГО папку. Запрос
+ * приходит как новый async-корень без контекста, поэтому оборачиваем здесь.
  */
-export function startHubServer(handlers: Handlers, token: string, port = HUB_PORT) {
+export function startHubServer(handlers: Handlers, token: string, port = HUB_PORT, ctx?: TenantContext) {
+  const runCtx = <T>(fn: () => T): T => (ctx ? tenantStore.run(ctx, fn) : fn());
   const server = Bun.serve({
     port,
     hostname: "127.0.0.1",
@@ -331,20 +336,23 @@ export function startHubServer(handlers: Handlers, token: string, port = HUB_POR
       if (url.pathname !== "/rpc" || req.method !== "POST") return new Response("not found", { status: 404 });
       if (req.headers.get("authorization") !== `Bearer ${token}`)
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
-      let op = "";
-      try {
-        const body = (await req.json()) as { op: string; args?: Args };
-        op = body.op;
-        const h = handlers[op];
-        if (!h) return Response.json({ error: `неизвестная операция: ${op}` });
-        const result = await h(body.args ?? {});
-        logAction(op, body.args, "ok");
-        return Response.json({ result });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        logAction(op, undefined, `ОШИБКА: ${msg}`);
-        return Response.json({ error: `Ошибка ${op}: ${msg}` });
-      }
+      const body = (await req.json().catch(() => ({}))) as { op?: string; args?: Args };
+      // Весь диспетчер (вызов + аудит-лог) — в контексте тенанта: и пути хендлеров, и
+      // actions.log должны указывать на папку ИМЕННО этого тенанта.
+      return runCtx(async () => {
+        const op = body.op ?? "";
+        try {
+          const h = handlers[op];
+          if (!h) return Response.json({ error: `неизвестная операция: ${op}` });
+          const result = await h(body.args ?? {});
+          logAction(op, body.args, "ok");
+          return Response.json({ result });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          logAction(op, undefined, `ОШИБКА: ${msg}`);
+          return Response.json({ error: `Ошибка ${op}: ${msg}` });
+        }
+      });
     },
   });
   log(`RPC-хаб слушает ${server.url}`);

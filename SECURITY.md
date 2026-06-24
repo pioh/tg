@@ -51,12 +51,14 @@
 
 ## Чувствительные файлы (никогда не коммить и не отправлять)
 
-- `data/session/*` — сессия Telegram (полный доступ к аккаунту!)
-- `data/config.json` — `api_id/api_hash`, токен бота
-- `data/permissions.json`, `data/service.lock`
+Для каждого пользователя — в его папке `tenants/<имя>/` (или legacy `data/`):
+
+- `session/*` — сессия Telegram (полный доступ к аккаунту!)
+- `config.json` — `api_id/api_hash`, токен бота
+- `permissions.json`, `service.lock`
 - `.env`
 
-Всё это в `.gitignore`. `api_id/api_hash` по умолчанию встроены (общие, как в исходной
+Папки `tenants/` и `data/` целиком в `.gitignore`. `api_id/api_hash` по умолчанию встроены (общие, как в исходной
 заготовке) — это сделано осознанно, чтобы не регистрировать своё приложение; хочешь свои
 — задай `TG_API_ID`/`TG_API_HASH`.
 

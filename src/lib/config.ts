@@ -2,7 +2,7 @@
 // -> значения по умолчанию. Bun автоматически загружает .env, поэтому переменные
 // можно держать и там (см. CLAUDE.md проекта — dotenv не нужен).
 
-import { CONFIG_PATH } from "./paths.ts";
+import { configPath } from "./paths.ts";
 import { atomicWriteJson } from "./atomic.ts";
 
 export type AgentEngine = "claude" | "codex";
@@ -55,6 +55,9 @@ export interface Config {
   botUsername?: string;
   /** chat_id владельца в переписке с ботом (куда бот пишет проактивно). */
   botOwnerChatId?: number;
+  /** chat_id «ассистент-группы» (семья): там бот отвечает на ВСЕ сообщения разрешённых
+   *  участников. Назначается командой /here в группе. Требует выключенного privacy-mode. */
+  botGroupChatId?: number;
 }
 
 // Встроенные api_id/api_hash (как в исходной заготовке base.js) — чтобы `login`
@@ -72,7 +75,7 @@ const DEFAULTS: Omit<Config, "apiId" | "apiHash"> = {
 };
 
 async function readFileConfig(): Promise<Partial<Config>> {
-  const file = Bun.file(CONFIG_PATH);
+  const file = Bun.file(configPath());
   if (!(await file.exists())) return {};
   try {
     return (await file.json()) as Partial<Config>;
@@ -111,6 +114,7 @@ export async function loadConfig(): Promise<Partial<Config>> {
     botToken: process.env.TG_BOT_TOKEN ?? f.botToken,
     botUsername: f.botUsername,
     botOwnerChatId: f.botOwnerChatId,
+    botGroupChatId: f.botGroupChatId,
   };
 }
 
@@ -132,7 +136,7 @@ let configGate: Promise<unknown> = Promise.resolve();
 export async function saveConfig(patch: Partial<Config>): Promise<void> {
   const run = configGate.then(async () => {
     const existing = await readFileConfig();
-    await atomicWriteJson(CONFIG_PATH, { ...existing, ...patch });
+    await atomicWriteJson(configPath(), { ...existing, ...patch });
   });
   configGate = run.then(
     () => {},

@@ -5,11 +5,8 @@
 // возвращает «созревшие» задачи; агент выполняет их инструкцию и доставляет
 // результат (deliver: bot — через сервисного бота; saved — в «Избранное»).
 
-import { join } from "node:path";
-import { DATA_DIR } from "./paths.ts";
+import { schedulesPath } from "./paths.ts";
 import { atomicWriteJson } from "./atomic.ts";
-
-const SCHEDULES_PATH = join(DATA_DIR, "schedules.json");
 
 export type DeliverTo = "bot" | "saved";
 
@@ -28,7 +25,7 @@ interface SchedulesFile {
 }
 
 async function load(): Promise<SchedulesFile> {
-  const f = Bun.file(SCHEDULES_PATH);
+  const f = Bun.file(schedulesPath());
   if (!(await f.exists())) return { schedules: [] };
   try {
     return { schedules: [], ...((await f.json()) as Partial<SchedulesFile>) };
@@ -37,7 +34,7 @@ async function load(): Promise<SchedulesFile> {
   }
 }
 async function save(data: SchedulesFile): Promise<void> {
-  await atomicWriteJson(SCHEDULES_PATH, data);
+  await atomicWriteJson(schedulesPath(), data);
 }
 function newId(existing: Schedule[]): string {
   let n = existing.length + 1;

@@ -25,7 +25,7 @@ function failResult(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-const server = new McpServer({ name: "tg", version: "0.4.0" });
+const server = new McpServer({ name: "tg", version: "0.5.0" });
 
 // Прокси-обёртка: инструмент пересылает свои аргументы в хаб как операцию `op`.
 function proxy(name: string, cfg: unknown, op: string): void {

@@ -7,3 +7,5 @@ import { join } from "node:path";
 
 export const TEST_DATA_DIR: string = mkdtempSync(join(tmpdir(), "tg-test-"));
 process.env.TG_DATA_DIR = TEST_DATA_DIR;
+// И корень тенантов — во временную папку (мультитенант-тесты не трогают реальные tenants/).
+process.env.TG_TENANTS_DIR = join(TEST_DATA_DIR, "tenants");

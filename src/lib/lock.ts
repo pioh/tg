@@ -8,7 +8,7 @@
 
 import { unlink, open, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { LOCK_PATH } from "./paths.ts";
+import { lockPath } from "./paths.ts";
 
 export interface LockInfo {
   pid: number;
@@ -18,7 +18,7 @@ export interface LockInfo {
 }
 
 export async function readLock(): Promise<LockInfo | null> {
-  const f = Bun.file(LOCK_PATH);
+  const f = Bun.file(lockPath());
   if (!(await f.exists())) return null;
   try {
     return (await f.json()) as LockInfo;
@@ -80,10 +80,11 @@ export async function acquireLock(port: number): Promise<LockInfo> {
 
   const info: LockInfo = { pid: process.pid, port, token: randomToken(), startedAt: new Date().toISOString() };
   const data = JSON.stringify(info, null, 2) + "\n";
-  await mkdir(dirname(LOCK_PATH), { recursive: true });
+  const path = lockPath();
+  await mkdir(dirname(path), { recursive: true });
 
   const writeExclusive = async () => {
-    const fh = await open(LOCK_PATH, "wx", 0o600);
+    const fh = await open(path, "wx", 0o600);
     try {
       await fh.writeFile(data);
     } finally {
@@ -98,7 +99,7 @@ export async function acquireLock(port: number): Promise<LockInfo> {
     // lock появился между проверкой и созданием — это либо живой сервис, либо stale
     const again = await serviceRunning();
     if (again) throw alreadyRunning(again);
-    await unlink(LOCK_PATH).catch(() => {});
+    await unlink(path).catch(() => {});
     await writeExclusive();
   }
   return info;
@@ -107,5 +108,5 @@ export async function acquireLock(port: number): Promise<LockInfo> {
 /** Снимает lock, только если он наш (по pid). */
 export async function releaseLock(): Promise<void> {
   const lock = await readLock();
-  if (lock && lock.pid === process.pid) await unlink(LOCK_PATH).catch(() => {});
+  if (lock && lock.pid === process.pid) await unlink(lockPath()).catch(() => {});
 }

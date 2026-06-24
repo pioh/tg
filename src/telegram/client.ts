@@ -13,16 +13,16 @@
 
 import { TelegramClient } from "@mtcute/bun";
 import { mkdir } from "node:fs/promises";
-import { SESSION_DIR, SESSION_PATH } from "../lib/paths.ts";
+import { sessionDir, sessionPath } from "../lib/paths.ts";
 import { requireConfig } from "../lib/config.ts";
 
 export async function createClient(): Promise<TelegramClient> {
   const cfg = await requireConfig();
-  await mkdir(SESSION_DIR, { recursive: true });
+  await mkdir(sessionDir(), { recursive: true });
   return new TelegramClient({
     apiId: cfg.apiId,
     apiHash: cfg.apiHash,
-    storage: SESSION_PATH,
+    storage: sessionPath(),
   });
 }
 
@@ -30,7 +30,7 @@ export async function createClient(): Promise<TelegramClient> {
  *  Это лёгкая эвристика; точную проверку авторизации даёт isLoggedIn(). */
 export async function hasSession(): Promise<boolean> {
   // mtcute (bun:sqlite) создаёт файл ровно с именем storage-пути, без суффикса.
-  return Bun.file(SESSION_PATH).exists();
+  return Bun.file(sessionPath()).exists();
 }
 
 /** Точная проверка: реально ли авторизованы. Подключается, зовёт getMe, отключается. */

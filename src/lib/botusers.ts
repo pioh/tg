@@ -8,11 +8,8 @@
 //
 // Хранилище: data/bot-users.json (личное, не в git).
 
-import { join } from "node:path";
-import { DATA_DIR } from "./paths.ts";
+import { botUsersPath } from "./paths.ts";
 import { atomicWriteJson } from "./atomic.ts";
-
-const BOT_USERS_PATH = join(DATA_DIR, "bot-users.json");
 
 export interface BotUser {
   id: number;
@@ -26,7 +23,7 @@ interface BotUsersFile {
 }
 
 async function load(): Promise<BotUsersFile> {
-  const f = Bun.file(BOT_USERS_PATH);
+  const f = Bun.file(botUsersPath());
   if (!(await f.exists())) return { allowed: [] };
   try {
     const raw = (await f.json()) as Partial<BotUsersFile>;
@@ -37,7 +34,7 @@ async function load(): Promise<BotUsersFile> {
 }
 
 async function save(data: BotUsersFile): Promise<void> {
-  await atomicWriteJson(BOT_USERS_PATH, data);
+  await atomicWriteJson(botUsersPath(), data);
 }
 
 export async function listBotUsers(): Promise<BotUser[]> {

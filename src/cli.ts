@@ -20,6 +20,7 @@ import { listPermissions, revokePermission } from "./lib/permissions.ts";
 import { ensureDataLayout, readHandoff, recordQa } from "./lib/memory.ts";
 import { installService, uninstallService, serviceDocs } from "./lib/service-install.ts";
 import { currentVersion, checkForUpdate, applyUpdate } from "./lib/update.ts";
+import { createTenant, listTenants, migrateLegacy, tenantExists } from "./lib/tenants.ts";
 
 function spawnBun(file: string, args: string[] = []): Promise<number> {
   const proc = Bun.spawn(["bun", "run", file, ...args], {
@@ -50,6 +51,8 @@ async function doctor(): Promise<void> {
   console.log("\n🔎 Проверка окружения tg\n");
   line("Bun", Bun.version);
   line("Корень проекта", REPO_ROOT);
+  const tenants = await listTenants();
+  line("Тенанты (tenants/)", tenants.length ? tenants.join(", ") : "нет (legacy data/ или создай: tenant add <имя>)");
 
   const claude = await tryVersion(["claude", "--version"]);
   line("Claude Code CLI", claude ?? "❌ не найден (нужен для движка claude)");
@@ -102,8 +105,8 @@ async function prepublish(): Promise<void> {
   const files = (await $`git ls-files`.text()).split("\n").filter(Boolean);
   const problems: string[] = [];
 
-  const dataTracked = files.filter((f) => f.startsWith("data/") && f !== "data/.gitkeep");
-  if (dataTracked.length) problems.push(`data/ отслеживается git: ${dataTracked.join(", ")}`);
+  const dataTracked = files.filter((f) => (f.startsWith("data/") && f !== "data/.gitkeep") || f.startsWith("tenants/"));
+  if (dataTracked.length) problems.push(`личные папки отслеживаются git: ${dataTracked.join(", ")}`);
 
   const specTracked = files.filter((f) => f.startsWith("spec/"));
   if (specTracked.length) problems.push(`spec/ отслеживается git (личные заметки): ${specTracked.join(", ")}`);
@@ -201,12 +204,56 @@ async function updateCmd(): Promise<void> {
   console.log(`✅ Обновлено до ${r.version}. Перезапусти сервис, чтобы применить (если запущен): systemctl --user restart tg-agent / launchctl … / Ctrl+C + bun run service.`);
 }
 
+async function tenantCmd(rest: string[]): Promise<void> {
+  const [sub, name] = rest;
+  if (sub === "list" || !sub) {
+    const names = await listTenants();
+    if (!names.length) {
+      console.log("Тенантов нет. Создай: bun run tg tenant add <имя>  (или мигрируй: bun run tg tenant migrate-legacy <имя>)");
+      return;
+    }
+    console.log("Тенанты (по одному пользователю на папку tenants/<имя>):\n");
+    for (const n of names) console.log(`  ${n}`);
+    return;
+  }
+  if (sub === "add") {
+    if (!name) {
+      console.error("Укажи имя: bun run tg tenant add <имя>");
+      process.exit(1);
+    }
+    if (await tenantExists(name)) {
+      console.log(`Тенант «${name}» уже есть.`);
+      return;
+    }
+    await createTenant(name);
+    console.log(`✅ Создан тенант «${name}». Войди в его Telegram: bun run tg login ${name}, затем настрой: bun run tg setup ${name}.`);
+    return;
+  }
+  if (sub === "migrate-legacy") {
+    if (!name) {
+      console.error("Укажи имя: bun run tg tenant migrate-legacy <имя>  (перенесёт текущую data/ в tenants/<имя>)");
+      process.exit(1);
+    }
+    const running = await serviceRunning();
+    if (running) {
+      console.error(`⚠️ Сервис запущен (pid ${running.pid}). Останови его перед миграцией, иначе можно потерять данные.`);
+      process.exit(1);
+    }
+    const dest = await migrateLegacy(name);
+    console.log(`✅ Перенёс data/ → ${dest}. Запусти сервис: bun run service.`);
+    return;
+  }
+  console.error(`Неизвестно: tenant ${sub}. Доступно: list, add <имя>, migrate-legacy <имя>`);
+  process.exit(1);
+}
+
 function help(): void {
   console.log(
     `tg — ИИ-агент для личного Telegram\n\n` +
       `Использование: bun run tg <команда>\n\n` +
-      `  setup                 мастер настройки (вход + бот + базовое) — начните с него\n` +
-      `  login                 интерактивный вход в Telegram\n` +
+      `  setup [имя]           мастер настройки тенанта (вход + бот + базовое) — начните с него\n` +
+      `  login [имя]           интерактивный вход в Telegram (для тенанта <имя>)\n` +
+      `  tenant <list|add <имя>|migrate-legacy <имя>>  управление пользователями (тенантами)\n` +
       `  service [--once]       запустить агента-сервис (--once — один проход)\n` +
       `  install-service       поставить как фоновый сервис (systemd/launchd) + автозапуск\n` +
       `  uninstall-service     удалить фоновый сервис\n` +
@@ -226,10 +273,14 @@ async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
     case "setup":
-      process.exit(await spawnBun(join("src", "setup.ts")));
+      process.exit(await spawnBun(join("src", "setup.ts"), rest));
       break;
     case "login":
-      process.exit(await spawnBun(join("src", "login.ts")));
+      process.exit(await spawnBun(join("src", "login.ts"), rest));
+      break;
+    case "tenant":
+    case "tenants":
+      await tenantCmd(rest);
       break;
     case "service":
       process.exit(await spawnBun(join("src", "service.ts"), rest));

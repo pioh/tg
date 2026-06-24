@@ -1,7 +1,7 @@
 // Внутреннее состояние сервиса (data/state.json): курсоры опроса и пр.
 // Это НЕ память агента (та — в handoff/progress/qa), а технические метки.
 
-import { STATE_PATH } from "./paths.ts";
+import { statePath } from "./paths.ts";
 import { atomicWriteJson } from "./atomic.ts";
 
 export interface AgentUsage {
@@ -33,7 +33,7 @@ export interface ServiceState {
 const EMPTY: ServiceState = { controlCursor: {} };
 
 export async function loadState(): Promise<ServiceState> {
-  const file = Bun.file(STATE_PATH);
+  const file = Bun.file(statePath());
   if (!(await file.exists())) return structuredClone(EMPTY);
   try {
     return { ...EMPTY, ...((await file.json()) as Partial<ServiceState>) };
@@ -43,7 +43,7 @@ export async function loadState(): Promise<ServiceState> {
 }
 
 export async function saveState(state: ServiceState): Promise<void> {
-  await atomicWriteJson(STATE_PATH, state);
+  await atomicWriteJson(statePath(), state);
 }
 
 // Сериализуем read-modify-write по state.json. Без этого два параллельных цикла
