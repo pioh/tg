@@ -58,14 +58,25 @@ function askYesNo(question: string, def = true): boolean {
   return s === "y" || s === "yes" || s === "д" || s === "да";
 }
 
-/** Запускает сервис ТОЛЬКО для этого тенанта (TG_ONLY_TENANT) и ждёт его хаб. */
+/** Свободный TCP-порт (чтобы временный сервис не конфликтовал с уже запущенным на 8765). */
+function findFreePort(): number {
+  const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+  const p = s.port;
+  s.stop(true);
+  if (typeof p !== "number" || p <= 0) throw new Error("не удалось выделить свободный порт");
+  return p;
+}
+
+/** Запускает сервис ТОЛЬКО для этого тенанта (TG_ONLY_TENANT) на свободном порту и ждёт
+ *  его хаб (serviceRunning читает порт из lock тенанта, так что фактический порт неважен). */
 async function startServiceChild(ctx: TenantContext): Promise<ReturnType<typeof Bun.spawn>> {
+  const port = findFreePort();
   const proc = Bun.spawn(["bun", "run", "src/service.ts"], {
     cwd: REPO_ROOT,
     stdin: "ignore",
     stdout: "inherit",
     stderr: "inherit",
-    env: { ...process.env, TG_ONLY_TENANT: ctx.name },
+    env: { ...process.env, TG_ONLY_TENANT: ctx.name, TG_HUB_PORT: String(port) },
   });
   for (let i = 0; i < 60; i++) {
     if (await withTenant(ctx, () => serviceRunning())) return proc;

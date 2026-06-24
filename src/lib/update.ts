@@ -106,13 +106,20 @@ export async function applyUpdate(): Promise<UpdateResult> {
     return { ok: false, output: pull.out, error: `git pull не удался: ${pull.err || pull.out}. Возможны локальные правки — обнови вручную.` };
   }
   let installOut = "";
+  let installCode = 0;
   try {
     const p = Bun.spawn(["bun", "install"], { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" });
     installOut = (await new Response(p.stdout).text()) + (await new Response(p.stderr).text());
-    await p.exited;
+    installCode = await p.exited;
   } catch (e) {
+    installCode = 1;
     installOut = e instanceof Error ? e.message : String(e);
   }
   const version = await currentVersion();
-  return { ok: true, version, output: `${pull.out}\n${installOut}`.trim() };
+  const output = `${pull.out}\n${installOut}`.trim();
+  // Если bun install упал — НЕ рапортуем успех (и вызывающий не должен перезапускаться).
+  if (installCode !== 0) {
+    return { ok: false, version, output, error: `bun install завершился с кодом ${installCode}: ${installOut.slice(-300)}` };
+  }
+  return { ok: true, version, output };
 }

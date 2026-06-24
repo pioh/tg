@@ -165,6 +165,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   let currentModel = "opus";
   let currentEffort: string | undefined;
   let engine: "claude" | "codex" = "claude";
+  let botUsername: string | undefined; // для отсева команд, адресованных другому боту
 
   let agentSessionId: string | undefined;
   let codexThreadId: string | undefined;
@@ -173,10 +174,15 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
 
   let pendingMode: "fresh" | "keep" | null = null;
   let resetRequested = false;
-  let pendingBuffer: unknown[] = [];
+  // Буфер событий на время пересоздания/рестарта сессии (с целью ответа).
+  let pendingBuffer: { obj: unknown; target: number | undefined }[] = [];
   let applying = false;
 
-  let lastBotChatId: number | undefined;
+  // FIFO целей ответа: на каждое запушенное событие — чат, КУДА уйдёт текст этого хода.
+  // forwardAgentText шлёт в голову очереди (текущий ход), onTurnEnd её сдвигает. Так
+  // ответ не «утечёт» в чужой чат при чередовании сообщений из разных чатов/групп.
+  let replyTargets: (number | undefined)[] = [];
+  const currentTarget = (): number | undefined => replyTargets[0];
   let forwardGate: Promise<unknown> = Promise.resolve();
   const notifiedUnknown = new Set<number>();
 
@@ -193,10 +199,11 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   };
 
   // Текст агента → человеку (как сообщение бота, MarkdownV2, длинное режется). Серия.
+  // Цель — голова FIFO (чат текущего хода); для событий без адресата (мониторы) — owner.
   function forwardAgentText(text: string): void {
     const t = text.trim();
     if (!t) return;
-    const chatId = lastBotChatId;
+    const chatId = currentTarget();
     forwardGate = forwardGate.then(() => handlers?.bot_send?.({ text: t, chat_id: chatId }).catch(() => {}));
   }
 
@@ -257,6 +264,8 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     if (now - lastCrashTs > 60000) crashCount = 0;
     lastCrashTs = now;
     crashCount++;
+    inflight = 0; // ход не завершится — сбрасываем (иначе typing «долбит» вечно)
+    replyTargets = []; // цели мёртвых ходов сняты (выравнивание с inflight)
     lg("watchdog: сессия агента упала:", err instanceof Error ? err.message : err);
     if (crashCount > 5) {
       crashStopped = true;
@@ -265,7 +274,6 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       await handlers?.bot_send?.({ text: "⛔ Агент-сессия падает повторно. Перезапуск остановлен — проверь /model и логи." }).catch(() => {});
       return;
     }
-    inflight = 0;
     await sleep(Math.min(30000, 1000 * 2 ** crashCount));
     try {
       await startSession(agentSessionId);
@@ -274,6 +282,8 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     } finally {
       restarting = false;
     }
+    // События, пришедшие в окно backoff, копились в буфере — переигрываем в новую сессию.
+    replayBuffer();
   }
 
   function onTurnEnd(usage: TurnUsage, sessionId: string | undefined, queueEmpty: boolean): void {
@@ -288,6 +298,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       startedAt: agentUsage.startedAt,
     };
     inflight = Math.max(0, inflight - 1);
+    replyTargets.shift(); // ход завершён — снимаем его цель ответа
     void persistAgent();
     if (inflight === 0 && queueEmpty) void applyPending();
   }
@@ -309,19 +320,29 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     } finally {
       applying = false;
     }
-    if (pendingBuffer.length) {
-      const buf = pendingBuffer;
-      pendingBuffer = [];
-      for (const obj of buf) pushEvent(obj);
-    }
+    replayBuffer();
   }
 
-  function pushEvent(obj: unknown): void {
-    if (pendingMode || resetRequested || applying) {
-      pendingBuffer.push(obj);
+  function replayBuffer(): void {
+    if (!pendingBuffer.length) return;
+    const buf = pendingBuffer;
+    pendingBuffer = [];
+    for (const e of buf) pushEvent(e.obj, e.target);
+  }
+
+  function pushEvent(obj: unknown, target?: number): void {
+    // Пока сессия пересоздаётся/рестартится (watchdog) — копим события (с целью ответа),
+    // чтобы не пушить в мёртвую очередь и не терять их. crashStopped — сессия мертва.
+    if (crashStopped) {
+      lg("событие пропущено: агент-сессия остановлена (см. логи)");
+      return;
+    }
+    if (pendingMode || resetRequested || applying || restarting) {
+      pendingBuffer.push({ obj, target });
       return;
     }
     inflight++;
+    replyTargets.push(target);
     const head = needIntro ? LIVE_INTRO + "\nСОБЫТИЕ:\n" : "Новое событие:\n";
     needIntro = false;
     session!.push(head + JSON.stringify(obj, null, 2));
@@ -353,8 +374,13 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       const reply = (t: string) => h.bot_send!({ text: t, chat_id: to }).catch(() => {});
       const arg = text.replace(/^\/\S+\s*/, "").trim();
       const isCmd = lower.startsWith("/");
-      // В группах команда приходит как «/cmd@botusername [args]» — берём чистый токен.
-      const cmd = lower.split(/\s+/)[0]!.split("@")[0];
+      // В группах команда приходит как «/cmd@botusername [args]».
+      const token0 = lower.split(/\s+/)[0]!;
+      const atIdx = token0.indexOf("@");
+      const cmd = atIdx >= 0 ? token0.slice(0, atIdx) : token0;
+      const cmdSuffix = atIdx >= 0 ? token0.slice(atIdx + 1) : "";
+      // Команда явно адресована ДРУГОМУ боту (/cmd@OtherBot) — не наша, игнорируем.
+      if (isCmd && cmdSuffix && botUsername && cmdSuffix !== botUsername.toLowerCase()) continue;
 
       if (cmd === "/help" || cmd === "/start") {
         await reply(helpText(isOwner));
@@ -385,9 +411,16 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       } else if (cmd === "/model") {
         if (arg) {
           currentModel = arg;
-          session?.setModel(arg);
           await saveConfig({ model: arg });
-          await reply(`🧠 Модель: ${arg}`);
+          if (engine === "codex") {
+            // У Codex смена модели на лету не поддерживается — пересоздаём сессию.
+            pendingMode = pendingMode ?? "keep";
+            if (inflight === 0) await applyPending();
+            await reply(`🧠 Модель: ${arg} (применю со следующего хода).`);
+          } else {
+            session?.setModel(arg); // Claude — на лету
+            await reply(`🧠 Модель: ${arg}`);
+          }
         } else await reply(`Текущая модель: ${currentModel}. Использование: /model <opus|sonnet|haiku|…>`);
       } else if (cmd === "/effort") {
         if (arg) {
@@ -486,10 +519,9 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       } else if (isCmd) {
         await reply("Неизвестная команда. /help — список команд.");
       } else {
-        // обычный текст → событие агенту; ответ уйдёт его текстом автоматически.
-        lastBotChatId = to;
+        // обычный текст → событие агенту; ответ уйдёт его текстом В ЭТОТ чат (target=to).
         await h.bot_typing!({ chat_id: to }).catch(() => {});
-        pushEvent({ botMessages: [m], replyTo: { chatId: to, isOwner } });
+        pushEvent({ botMessages: [m], replyTo: { chatId: to, isOwner } }, to);
       }
     }
   }
@@ -504,6 +536,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     currentModel = cfg.model;
     currentEffort = cfg.effort;
     engine = cfg.agent;
+    botUsername = cfg.botUsername;
 
     const lock = await acquireLock(ctx.hubPort);
     hubToken = lock.token;
@@ -556,7 +589,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     // индикатор «печатает…», пока агент работает
     (async () => {
       while (!stopping && !globalStopping) {
-        if (inflight > 0) await h.bot_typing!({ chat_id: lastBotChatId }).catch(() => {});
+        if (inflight > 0) await h.bot_typing!({ chat_id: currentTarget() }).catch(() => {});
         await sleep(4000);
       }
     })();

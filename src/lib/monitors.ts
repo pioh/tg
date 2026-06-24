@@ -162,7 +162,13 @@ export async function updateMonitor(id: string, patch: Partial<Monitor>): Promis
 function matches(m: Message, meId: number, f?: MonitorMatch): boolean {
   if (!f) return true;
   if (f.fromUserId != null && m.sender?.id !== f.fromUserId) return false;
-  if (f.mentionsMe && !(m.isMention || m.replyToMessage?.id != null)) return false;
+  if (f.mentionsMe) {
+    // «Упомянули меня» = реальный @-mention ИЛИ ответ именно на МОЁ сообщение
+    // (любой reply кому угодно за упоминание НЕ считаем).
+    const rs = m.replyToMessage?.sender;
+    const repliesToMe = !!rs && "id" in rs && rs.id === meId;
+    if (!(m.isMention || repliesToMe)) return false;
+  }
   if (f.keywords && f.keywords.length > 0) {
     const text = (m.text ?? "").toLowerCase();
     if (!f.keywords.some((k) => text.includes(k.toLowerCase()))) return false;
