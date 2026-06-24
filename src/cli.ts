@@ -10,7 +10,7 @@
 //   help             эта справка
 
 import { $ } from "bun";
-import { REPO_ROOT, MCP_SERVER_PATH } from "./lib/paths.ts";
+import { REPO_ROOT, MCP_SERVER_PATH, type TenantContext } from "./lib/paths.ts";
 import { join } from "node:path";
 import { loadConfig } from "./lib/config.ts";
 import { isLoggedIn } from "./telegram/client.ts";
@@ -20,7 +20,24 @@ import { listPermissions, revokePermission } from "./lib/permissions.ts";
 import { ensureDataLayout, readHandoff, recordQa } from "./lib/memory.ts";
 import { installService, uninstallService, serviceDocs } from "./lib/service-install.ts";
 import { currentVersion, checkForUpdate, applyUpdate } from "./lib/update.ts";
-import { createTenant, listTenants, migrateLegacy, tenantExists } from "./lib/tenants.ts";
+import { autoMigrateLegacy, createTenant, listTenants, migrateLegacy, tenantContext, tenantExists, withTenant } from "./lib/tenants.ts";
+
+// Выбор тенанта для команд, работающих с рабочей папкой. Если имя задано первым
+// аргументом и совпадает с существующим — берём его (и убираем из rest). Иначе: один
+// тенант — берём его; несколько — просим указать имя; ноль — ошибка.
+async function cliTenant(rest: string[]): Promise<{ ctx: TenantContext; rest: string[] }> {
+  const names = await listTenants();
+  if (names.length === 0) {
+    console.error("Нет ни одного пользователя. Создай: bun run tg setup <имя> (или tenant add <имя>).");
+    process.exit(1);
+  }
+  if (rest[0] && names.includes(rest[0])) {
+    return { ctx: tenantContext(rest[0], names.indexOf(rest[0])), rest: rest.slice(1) };
+  }
+  if (names.length === 1) return { ctx: tenantContext(names[0]!, 0), rest };
+  console.error(`Несколько пользователей (${names.join(", ")}) — укажи имя первым аргументом.`);
+  process.exit(1);
+}
 
 function spawnBun(file: string, args: string[] = []): Promise<number> {
   const proc = Bun.spawn(["bun", "run", file, ...args], {
@@ -44,42 +61,48 @@ async function tryVersion(cmd: string[]): Promise<string | null> {
 }
 
 async function doctor(): Promise<void> {
-  await ensureDataLayout();
-  const cfg = await loadConfig();
   const line = (label: string, val: string) => console.log(`  ${label.padEnd(26)} ${val}`);
 
   console.log("\n🔎 Проверка окружения tg\n");
   line("Bun", Bun.version);
   line("Корень проекта", REPO_ROOT);
-  const tenants = await listTenants();
-  line("Тенанты (tenants/)", tenants.length ? tenants.join(", ") : "нет (legacy data/ или создай: tenant add <имя>)");
+
+  // Авто-миграция: если осталась старая data/ — переносим в tenants/ (без ручных шагов).
+  const migrated = await autoMigrateLegacy().catch(() => null);
+  if (migrated) line("Авто-миграция", `✅ data/ → ${migrated}`);
 
   const claude = await tryVersion(["claude", "--version"]);
   line("Claude Code CLI", claude ?? "❌ не найден (нужен для движка claude)");
   const codex = await tryVersion(["codex", "--version"]);
   line("Codex CLI", codex ?? "⚠️ не найден (нужен для движка codex)");
 
-  line("API-креды Telegram", `✅ id=${cfg.apiId} ${cfg.apiId === 25282 ? "(встроенные по умолчанию)" : "(свои)"}`);
-
-  // Если сервис уже запущен — НЕ открываем сессию сами (единственный владелец),
-  // а спрашиваем хаб. Иначе делаем лёгкую прямую проверку.
-  const running = await serviceRunning();
-  if (running) {
-    line("Сервис", `✅ запущен (pid ${running.pid}, порт ${running.port})`);
-    try {
-      const who = (await hubCall("whoami")) as { name?: string; username?: string | null };
-      line("Сессия Telegram", `✅ через хаб: ${who.name}${who.username ? ` (@${who.username})` : ""}`);
-    } catch {
-      line("Сессия Telegram", "⚠️ сервис запущен, но хаб не ответил");
-    }
+  // Пер-тенантная проверка (у каждого своя сессия/бот/конфиг).
+  const tenants = await listTenants();
+  if (!tenants.length) {
+    line("Пользователи", "нет — создай: bun run tg setup <имя>");
   } else {
-    line("Сервис", "не запущен (`bun run service`)");
-    const me = await isLoggedIn().catch(() => null);
-    line("Сессия Telegram", me ? `✅ вход выполнен: ${me.name}${me.username ? ` (@${me.username})` : ""}` : "❌ нет — запустите `login`");
+    line("Пользователи", tenants.join(", "));
+    for (let i = 0; i < tenants.length; i++) {
+      const ctx = tenantContext(tenants[i]!, i);
+      await withTenant(ctx, async () => {
+        const cfg = await loadConfig();
+        const running = await serviceRunning();
+        let who = "";
+        if (running) {
+          try {
+            const w = (await hubCall("whoami")) as { name?: string; username?: string | null };
+            who = `✅ ${w.name}${w.username ? ` (@${w.username})` : ""} (через хаб)`;
+          } catch {
+            who = "⚠️ хаб не ответил";
+          }
+        } else {
+          const me = await isLoggedIn().catch(() => null);
+          who = me ? `✅ ${me.name}${me.username ? ` (@${me.username})` : ""}` : `❌ нет входа — bun run tg login ${ctx.name}`;
+        }
+        line(`  • ${ctx.name}`, `${who} · движок ${cfg.agent}/${cfg.model} · ${running ? `сервис pid ${running.pid}` : "сервис не запущен"}`);
+      });
+    }
   }
-  line("Движок по умолчанию", `${cfg.agent} (модель ${cfg.model})`);
-  line("Управляющий канал", String(cfg.controlChat));
-  line("Интервал тика", `${cfg.intervalSeconds}s`);
 
   console.log("\n🔑 Аутентификация движка\n");
   if (process.env.ANTHROPIC_API_KEY) {
@@ -121,12 +144,10 @@ async function prepublish(): Promise<void> {
     if (botToken.test(txt)) problems.push(`похоже на bot-токен в ${f}`);
   }
 
-  const running = await serviceRunning();
-  console.log(`  data/ чисто:        ${dataTracked.length ? "❌" : "✅"}`);
+  console.log(`  личные папки чисто: ${dataTracked.length ? "❌" : "✅"} (data/, tenants/ не в git)`);
   console.log(`  spec/ не в git:     ${specTracked.length ? "❌" : "✅"}`);
   console.log(`  секретов в коде:    ${problems.some((p) => p.includes("токен")) ? "❌" : "✅ не найдено"}`);
   console.log(`  hub-auth включён:   ✅ (bearer-токен, см. lib/lock.ts)`);
-  console.log(`  сервис сейчас:      ${running ? `запущен (pid ${running.pid})` : "не запущен"}`);
 
   if (problems.length) {
     console.log("\n❌ Найдены проблемы:\n" + problems.map((p) => `  - ${p}`).join("\n") + "\n");
@@ -262,10 +283,11 @@ function help(): void {
       `  update                обновиться до последней версии (git pull + bun install)\n` +
       `  mcp                   запустить MCP-сервер вручную\n` +
       `  doctor [--prepublish] проверить окружение (или готовность к публикации)\n` +
-      `  permissions [list|revoke <chat>]  разрешения на отправку\n` +
-      `  qa "<текст>"          записать просьбу человека дословно в data/qa\n` +
-      `  status                показать текущий handoff\n` +
-      `  help                  эта справка\n`,
+      `  permissions [имя] [list|revoke <chat>]  разрешения на отправку\n` +
+      `  qa [имя] "<текст>"    записать просьбу человека дословно (в папку пользователя)\n` +
+      `  status [имя]          показать handoff пользователя\n` +
+      `  help                  эта справка\n` +
+      `\n[имя] — пользователь (tenant); можно опустить, если он один.\n`,
   );
 }
 
@@ -311,23 +333,30 @@ async function main(): Promise<void> {
       else await doctor();
       break;
     case "permissions":
-    case "perms":
-      await permissionsCmd(rest);
+    case "perms": {
+      const { ctx, rest: r } = await cliTenant(rest);
+      await withTenant(ctx, () => permissionsCmd(r));
       break;
+    }
     case "qa": {
-      const text = rest.join(" ").trim();
+      const { ctx, rest: r } = await cliTenant(rest);
+      const text = r.join(" ").trim();
       if (!text) {
-        console.error('Укажите текст: bun run tg qa "..."');
+        console.error('Укажите текст: bun run tg qa [имя] "..."');
         process.exit(1);
       }
-      const file = await recordQa(text, "cli");
+      const file = await withTenant(ctx, () => recordQa(text, "cli"));
       console.log(`Записано дословно в ${file}`);
       break;
     }
-    case "status":
-      await ensureDataLayout();
-      console.log(await readHandoff());
+    case "status": {
+      const { ctx } = await cliTenant(rest);
+      await withTenant(ctx, async () => {
+        await ensureDataLayout();
+        console.log(await readHandoff());
+      });
       break;
+    }
     case "help":
     case undefined:
       help();

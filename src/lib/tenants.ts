@@ -4,7 +4,7 @@
 // в контексте тенанта (через AsyncLocalStorage), и миграция legacy-папки data/.
 
 import { mkdir, readdir, rename, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { REPO_ROOT, TENANTS_DIR, tenantDir, tenantStore, type TenantContext } from "./paths.ts";
 import { ensureDataLayout } from "./memory.ts";
 
@@ -12,8 +12,9 @@ import { ensureDataLayout } from "./memory.ts";
 // в lock каждого тенанта — MCP-прокси читает его оттуда).
 export const HUB_BASE_PORT: number = Number(process.env.TG_HUB_PORT ?? 8765);
 
-// Legacy single-tenant папка (до перехода на tenants/): <repo>/data или TG_DATA_DIR.
-export function legacyDataDir(): string {
+// Старая единая папка data/ — ТОЛЬКО как источник для одноразовой миграции в tenants/.
+// В рантайме никакого legacy-режима нет (всё работает на тенантах).
+function legacyDataDir(): string {
   return process.env.TG_DATA_DIR ? resolve(process.env.TG_DATA_DIR) : resolve(REPO_ROOT, "data");
 }
 
@@ -23,10 +24,6 @@ async function isDir(p: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-export async function legacyExists(): Promise<boolean> {
-  return isDir(legacyDataDir());
 }
 
 function validateName(name: string): void {
@@ -82,4 +79,20 @@ export async function migrateLegacy(name: string): Promise<string> {
   await mkdir(TENANTS_DIR, { recursive: true });
   await rename(src, dest);
   return dest;
+}
+
+const AUTO_MIGRATE_NAME = "main"; // имя тенанта для автоматической миграции старой data/
+
+/** Автоматическая одноразовая миграция: если тенантов нет, но есть старая папка data/
+ *  (апгрейд со старой версии) — переносим её в tenants/main. Возвращает путь или null.
+ *  Зовётся на старте сервиса и в doctor, чтобы апгрейд проходил без ручных шагов. */
+export async function autoMigrateLegacy(): Promise<string | null> {
+  if ((await listTenants()).length > 0) return null; // уже на тенантах
+  const src = legacyDataDir();
+  if (!(await isDir(src))) return null; // папки нет
+  // Мигрируем только РЕАЛЬНУЮ старую установку (есть сессия или конфиг), а не пустой
+  // placeholder data/.gitkeep на свежем клоне.
+  const real = (await Bun.file(join(src, "session", "account")).exists()) || (await Bun.file(join(src, "config.json")).exists());
+  if (!real) return null;
+  return migrateLegacy(AUTO_MIGRATE_NAME);
 }

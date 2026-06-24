@@ -25,7 +25,7 @@ import { buildSystemAppend } from "./agent/prompt.ts";
 import { createAgentSession, type AgentSession, type TurnUsage } from "./agent/session.ts";
 import { log, fail } from "./lib/log.ts";
 import { type TenantContext } from "./lib/paths.ts";
-import { HUB_BASE_PORT, legacyExists, legacyDataDir, listTenants, tenantContext, withTenant } from "./lib/tenants.ts";
+import { autoMigrateLegacy, listTenants, tenantContext, withTenant } from "./lib/tenants.ts";
 
 const DETECT_SECONDS = Number(process.env.TG_DETECT_SECONDS ?? 3);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -54,6 +54,27 @@ Telegram (формат Telegram MarkdownV2). Поэтому НЕ нужно зв
 
 function freshUsage(): AgentUsage {
   return { turns: 0, contextTokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, costUsd: 0, startedAt: new Date().toISOString() };
+}
+
+// Порт хаба подбираем ДИНАМИЧЕСКИ (предпочитаем preferred, иначе любой свободный), чтобы
+// не конфликтовать с другими приложениями на машине. Фактический порт пишется в lock
+// тенанта — MCP-прокси берёт его оттуда. Так сервис стабилен сам по себе.
+function portAvailable(p: number): boolean {
+  try {
+    const s = Bun.serve({ port: p, hostname: "127.0.0.1", fetch: () => new Response("") });
+    s.stop(true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function pickPort(preferred: number): number {
+  if (portAvailable(preferred)) return preferred;
+  const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+  const p = s.port;
+  s.stop(true);
+  if (typeof p !== "number" || p <= 0) throw new Error("не удалось выделить свободный порт для хаба");
+  return p;
 }
 
 // ---------- общие, не зависящие от тенанта помощники форматирования ----------
@@ -161,6 +182,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   let server: ReturnType<typeof startHubServer> | undefined;
   let tg: Awaited<ReturnType<typeof createClient>> | undefined;
   let hubToken = "";
+  let hubPort = ctx.hubPort; // фактический порт (подбирается в init, если preferred занят)
 
   let currentModel = "opus";
   let currentEffort: string | undefined;
@@ -234,7 +256,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       effort: currentEffort,
       append,
       resume,
-      hubPort: ctx.hubPort,
+      hubPort,
       hubToken,
       codexResumeThreadId: codexThreadId,
       onText: forwardAgentText,
@@ -527,29 +549,43 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   }
 
   // Общая инициализация: layout, конфиг, lock(порт тенанта), клиент, хаб-хендлеры.
-  async function init(): Promise<void> {
+  // Возвращает аккаунт владельца (валидирует авторизацию РАНО, чтобы битый тенант не
+  // занимал lock/порт и не ронял процесс). Бросает при невалидной сессии — main это
+  // ловит и ПРОПУСКАЕТ тенанта, остальные продолжают работать.
+  async function init(): Promise<{ name: string }> {
     await ensureDataLayout();
     const cfg = await requireConfig();
     if (!(await hasSession())) {
-      throw new Error(`нет сессии Telegram (выполните: bun run tg login ${ctx.name})`);
+      throw new Error(`нет входа в Telegram (выполните: bun run tg login ${ctx.name})`);
     }
     currentModel = cfg.model;
     currentEffort = cfg.effort;
     engine = cfg.agent;
     botUsername = cfg.botUsername;
 
-    const lock = await acquireLock(ctx.hubPort);
-    hubToken = lock.token;
+    // 1) Клиент + проверка авторизации ДО захвата lock/порта.
+    tg = await createClient();
+    await tg.connect();
+    let me: { displayName: string };
+    try {
+      me = await tg.getMe();
+    } catch (e) {
+      await tg.destroy().catch(() => {});
+      tg = undefined;
+      throw new Error(`сессия Telegram недействительна (${e instanceof Error ? e.message : e}); войдите заново: bun run tg login ${ctx.name}`);
+    }
 
+    // 2) Авторизация ок — берём свободный порт, занимаем lock и поднимаем хаб.
+    hubPort = pickPort(ctx.hubPort);
+    const lock = await acquireLock(hubPort);
+    hubToken = lock.token;
     const st0 = await loadState();
     agentSessionId = st0.agentSessionId;
     codexThreadId = st0.codexThreadId;
     agentUsage = st0.agentUsage ?? freshUsage();
-
-    tg = await createClient();
-    await tg.connect();
     handlers = buildHandlers(tg, sessionCtx);
     server = startHubServer(handlers, lock.token, lock.port, ctx);
+    return { name: me.displayName };
   }
 
   function fireLoops(): void {
@@ -619,22 +655,26 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
 
   async function startService(): Promise<void> {
     await withTenant(ctx, async () => {
-      await init();
-      const me = await tg!.getMe();
-      await startSession(agentSessionId);
-      await registerBotCommands().catch(() => {});
-      await appendProgress(`service: старт тенанта ${ctx.name} (движок ${engine})`);
-      lg(`Запущен как ${me.displayName}. Движок=${engine}, модель=${currentModel}${currentEffort ? ", effort=" + currentEffort : ""}, порт ${ctx.hubPort}. Сессия: ${agentSessionId ? "продолжаю " + agentSessionId.slice(0, 8) : "новая"}.`);
-      fireLoops();
+      try {
+        const me = await init();
+        await startSession(agentSessionId);
+        await registerBotCommands().catch(() => {});
+        await appendProgress(`service: старт тенанта ${ctx.name} (движок ${engine})`);
+        lg(`Запущен как ${me.name}. Движок=${engine}, модель=${currentModel}${currentEffort ? ", effort=" + currentEffort : ""}, порт ${hubPort}. Сессия: ${agentSessionId ? "продолжаю " + agentSessionId.slice(0, 8) : "новая"}.`);
+        fireLoops();
+      } catch (e) {
+        await stop().catch(() => {}); // освободить lock/клиент/порт, если что-то заняли
+        throw e; // main посчитает тенанта незапустившимся и продолжит с остальными
+      }
     });
   }
 
   async function runOnce(): Promise<void> {
     await withTenant(ctx, async () => {
-      await init();
-      await startSession(agentSessionId);
-      lg(`--once: один проход. Движок=${engine}, модель=${currentModel}.`);
       try {
+        await init();
+        await startSession(agentSessionId);
+        lg(`--once: один проход. Движок=${engine}, модель=${currentModel}.`);
         const r = (await handlers!.bot_poll!({ timeout: 0 })) as { configured: boolean; newMessages: any[]; unauthorized?: any[] };
         if (r.configured && r.newMessages.length) await handleBotMessages(r.newMessages);
         if (r.configured && r.unauthorized?.length) await notifyUnauthorized(r.unauthorized);
@@ -670,17 +710,21 @@ async function resolveContexts(): Promise<TenantContext[]> {
   const only = process.env.TG_ONLY_TENANT;
   if (only) return [tenantContext(only, 0)];
 
+  // Никакого legacy-режима: при наличии старой data/ её автоматически мигрируем в tenants/.
+  const migrated = await autoMigrateLegacy();
+  if (migrated) log(`✅ Авто-миграция: data/ → ${migrated} (запускаю как тенант).`);
+
   const names = await listTenants();
-  if (names.length > 0) return names.map((n, i) => tenantContext(n, i));
-  // Нет папок tenants/ — пробуем legacy data/ как единственный тенант (до миграции).
-  if (await legacyExists()) {
-    log("⚠️ Тенанты не найдены — работаю на legacy-папке data/. Рекомендую: bun run tg tenant migrate-legacy <имя>");
-    return [{ name: "(legacy)", dataDir: legacyDataDir(), hubPort: HUB_BASE_PORT }];
-  }
-  return [];
+  return names.map((n, i) => tenantContext(n, i));
 }
 
 async function main(): Promise<void> {
+  // Защита мультитенанта: стрэй-ошибка фонового цикла одного тенанта (напр. сетевой сбой
+  // mtcute) НЕ должна ронять весь процесс и остальных пользователей. Логируем и живём.
+  process.on("unhandledRejection", (reason) => {
+    log("unhandledRejection (продолжаю):", reason instanceof Error ? reason.message : reason);
+  });
+
   const once = process.argv.includes("--once");
   const contexts = await resolveContexts();
   if (contexts.length === 0) {

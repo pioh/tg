@@ -80,7 +80,11 @@ export interface AgentSessionCtx {
 }
 
 export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handlers {
-  const meIdP = tg.getMe().then((m) => m.id);
+  // ЛЕНИВО: не дёргаем getMe в момент сборки хендлеров — иначе при невалидной сессии
+  // (AUTH_KEY_UNREGISTERED) возникает «висячий» unhandled rejection, который ронял
+  // весь процесс (и других тенантов). Создаётся при первом реальном вызове и кэшируется.
+  let meIdCache: Promise<number> | undefined;
+  const meIdP = (): Promise<number> => (meIdCache ??= tg.getMe().then((m) => m.id));
   const peerId = async (chat: string): Promise<number> => (await tg.getPeer(coercePeer(chat))).id;
 
   // Code-level gate: КОМУ агент имеет право писать. Разрешено: себе («Избранное»),
@@ -89,7 +93,7 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
   // (не только в промпте). См. rules/50-safety.md и lib/permissions.ts.
   async function assertCanSend(chat: string): Promise<void> {
     if (isSelfChat(chat)) return;
-    const meId = await meIdP;
+    const meId = await meIdP();
     const target = await peerId(chat);
     if (target === meId) return;
     const cfg = await loadConfig();
@@ -177,7 +181,7 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
       const cfg = await loadConfig();
       const chat = cfg.controlChat ?? "me";
       const peer = await tg.resolvePeer(coercePeer(chat));
-      const meId = await meIdP;
+      const meId = await meIdP();
       const key = String(chat);
       const since = (await loadState()).controlCursor[key] ?? 0;
       if (since === 0) {
@@ -260,7 +264,7 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
     // --- Бот (getUpdates сериализуется) ---
     bot_status: () => bot.botStatus(),
     bot_set_token: (a) => bot.setBotToken(a.token),
-    bot_poll: async (a) => botSerial(async () => bot.botPoll(await meIdP, a.timeout ?? 0)),
+    bot_poll: async (a) => botSerial(async () => bot.botPoll(await meIdP(), a.timeout ?? 0)),
     bot_send: (a) => bot.botSend(a.text, a.chat_id),
     bot_progress: (a) => bot.botProgress(a.text, a.chat_id),
     bot_typing: (a) => bot.botTyping(a.chat_id),

@@ -21,6 +21,7 @@ import {
   memoryDir,
   progressPath,
   qaDir,
+  REPO_ROOT,
   RULES_DIR,
   sessionDir,
 } from "./paths.ts";
@@ -314,10 +315,21 @@ export async function assembleContext(): Promise<AssembledContext> {
   };
 }
 
+/** Текущая версия проекта (для само-миграции агентом — см. rules/15-updates.md). */
+async function tgVersion(): Promise<string> {
+  try {
+    const pkg = (await Bun.file(join(REPO_ROOT, "package.json")).json()) as { version?: string };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "неизвестна";
+  }
+}
+
 /** Тот же контекст одной строкой markdown — для system-prompt / bootstrap. */
 export async function assembleContextText(): Promise<string> {
   const c = await assembleContext();
   return [
+    `# ВЕРСИЯ tg: ${await tgVersion()}  (если новее прежней и формат изменился — см. rules/15-updates.md и мигрируй)`,
     c.doctrine,
     `# ПРАВИЛА (rules/ + data/rules)\n\n${c.rules}`,
     `# ТЕКУЩИЙ СТАТУС (data/handoff.md)\n\n${c.handoff}`,

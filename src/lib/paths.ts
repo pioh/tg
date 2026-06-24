@@ -8,8 +8,8 @@
 // Чтобы не тащить путь тенанта руками через каждую функцию, текущий тенант хранится в
 // AsyncLocalStorage (tenantStore): сервис оборачивает обработку каждого тенанта в
 // tenantStore.run(ctx, …), и все path-функции ниже отдают пути ЕГО папки. Вне контекста
-// тенанта (CLI/тесты/одиночные команды) путь берётся из TG_DATA_DIR, иначе — <repo>/data
-// (legacy single-tenant). Это единственное «по умолчанию» и только для инструментов.
+// тенанта (CLI/тесты/дочерние процессы) путь берётся ТОЛЬКО из TG_DATA_DIR. Никакого
+// единого «data/»-режима больше нет — всё работает на тенантах (tenants/<имя>).
 //
 // ВАЖНО: жёсткое разделение src/ (код) и рабочих папок (личные данные, не в git).
 
@@ -42,11 +42,13 @@ export interface TenantContext {
 /** Контекст текущего тенанта (см. описание модуля). */
 export const tenantStore = new AsyncLocalStorage<TenantContext>();
 
-/** Рабочая папка ТЕКУЩЕГО тенанта (или legacy data/ вне контекста тенанта). */
+/** Рабочая папка ТЕКУЩЕГО тенанта. Вне контекста — только из TG_DATA_DIR (тесты/дочерние
+ *  процессы); если и его нет — ошибка (никакого скрытого «data/» по умолчанию). */
 export function dataDir(): string {
   const ctx = tenantStore.getStore();
   if (ctx) return ctx.dataDir;
-  return process.env.TG_DATA_DIR ? resolve(process.env.TG_DATA_DIR) : resolve(REPO_ROOT, "data");
+  if (process.env.TG_DATA_DIR) return resolve(process.env.TG_DATA_DIR);
+  throw new Error("Нет рабочей папки: код выполняется вне контекста тенанта и без TG_DATA_DIR. Укажите пользователя (tenant).");
 }
 
 /** Имя текущего тенанта, если есть контекст. */
