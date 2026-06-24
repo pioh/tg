@@ -1,0 +1,12 @@
+# Проектная конфигурация Codex. Подхватывается автоматически, когда проект
+# помечен доверенным (Codex спросит при первом запуске; либо добавьте в
+# ~/.codex/config.toml: [projects."<abs-путь>"] trust_level = "trusted").
+#
+# Тот же MCP-сервер, что и для Claude Code (.mcp.json) — единый источник истины
+# src/mcp/server.ts. stdout сервера зарезервирован под JSON-RPC.
+
+[mcp_servers.telegram]
+command = "bun"
+args = ["run", "src/mcp/server.ts"]
+cwd = "."
+startup_timeout_sec = 30
