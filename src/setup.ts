@@ -14,6 +14,7 @@ import { isLoggedIn, hasSession } from "./telegram/client.ts";
 import { loadConfig } from "./lib/config.ts";
 import { serviceRunning } from "./lib/lock.ts";
 import { REPO_ROOT } from "./lib/paths.ts";
+import { installService, serviceDocs, currentOS } from "./lib/service-install.ts";
 
 const SETUP_MISSION = `Ты — дружелюбный ассистент настройки личного Telegram-агента (проект tg).
 Проведи меня через настройку с МИНИМУМОМ действий с моей стороны: думай и предлагай
@@ -35,8 +36,8 @@ const SETUP_MISSION = `Ты — дружелюбный ассистент нас
    попрошу — настрой инструментами (monitor_add/schedule_add) и зафиксируй правило в
    data/rules; не попрошу — пропусти.
 4. Очень кратко перечисли возможности (мониторы, расписания, бот, просмотр фото,
-   пассивность по умолчанию, разрешения на ответы) и как запускать сервис (bun run
-   service).
+   пассивность по умолчанию, разрешения на ответы) и упомяни команды бота /help и
+   /start. После твоего завершения мастер сам предложит установить фоновый сервис.
 
 Действуй автономно, не заставляй меня выполнять лишние механические шаги.`;
 
@@ -61,18 +62,49 @@ async function startServiceChild(): Promise<ReturnType<typeof Bun.spawn>> {
   throw new Error("Сервис не поднялся за 30с. Проверьте вход в Telegram и логи выше.");
 }
 
+function askYesNo(question: string, def = true): boolean {
+  const ans = prompt(`${question} ${def ? "[Y/n]" : "[y/N]"} `);
+  if (ans === null) return def;
+  const s = ans.trim().toLowerCase();
+  if (s === "") return def;
+  return s === "y" || s === "yes" || s === "д" || s === "да";
+}
+
+async function offerServiceInstall(externalServiceRunning: boolean): Promise<void> {
+  const os = currentOS();
+  if (os === "win32" || os === "other") {
+    // Авто-установку на Windows не делаем — показываем инструкцию.
+    console.log("\nЧтобы агент работал в фоне постоянно (Windows):\n");
+    console.log(serviceDocs(os) + "\n");
+    return;
+  }
+  const mgr = os === "linux" ? "systemd --user" : "launchd";
+  if (!askYesNo(`\nУстановить агента как фоновый сервис (${mgr}), чтобы работал постоянно и сам стартовал после перезагрузки?`)) {
+    console.log("Ок, не ставлю. Можно потом: bun run tg install-service\n");
+    return;
+  }
+  // Если снаружи уже крутится ручной экземпляр — только включаем (не плодим второй).
+  const res = await installService(!externalServiceRunning);
+  console.log("");
+  for (const m of res.messages) console.log("  " + m);
+  if (externalServiceRunning) console.log("  ⚠️ Остановите ручной `bun run service` — дальше сервисом будет управлять система.");
+  console.log("\n" + res.docs + "\n");
+}
+
 async function main(): Promise<void> {
   await ensureDataLayout();
   console.log("Настройка tg. Один шаг механический (вход в Telegram), дальше всё делает агент.\n");
 
+  // 0) Если сервис уже запущен — он единственный владелец сессии: значит, вход уже
+  //    выполнен, отдельно его не трогаем (не открываем сессию параллельно).
+  const preRunning = Boolean(await serviceRunning());
+
   // 1) Вход (неизбежно интерактивный). Запускаем, только если ещё не вошли.
-  if (await isLoggedIn()) {
+  if (preRunning) {
+    console.log("✅ Сервис уже запущен (он держит сессию Telegram) — вход не требуется.\n");
+  } else if (await isLoggedIn()) {
     console.log("✅ Вход в Telegram уже выполнен.\n");
   } else {
-    if (await serviceRunning()) {
-      console.log("⚠️ Сервис уже запущен (он держит сессию). Остановите его и повторите вход: bun run setup");
-      process.exit(1);
-    }
     console.log("Шаг входа: откроется вход по QR (отсканируй с телефона). \n");
     const login = Bun.spawn(["bun", "run", "src/login.ts"], { cwd: REPO_ROOT, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
     await login.exited;
@@ -110,13 +142,19 @@ async function main(): Promise<void> {
     code = 1;
   }
 
-  // 4) Останавливаем поднятый нами сервис (если запускали его сами).
+  // 4) Останавливаем поднятый нами временный сервис (если запускали его сами), чтобы
+  //    освободить lock перед установкой постоянного сервиса.
   if (child) {
     console.log("\nОстанавливаю временный сервис настройки…");
     child.kill();
     await child.exited.catch(() => {});
   }
-  console.log("\nГотово. Запусти агента: bun run service\n");
+
+  // 5) Предлагаем поставить агента как фоновый сервис нативно для платформы и печатаем
+  //    доку (логи/стоп/рестарт). preRunning=true → снаружи уже крутится ручной экземпляр.
+  await offerServiceInstall(preRunning).catch((e) => console.log("Установка сервиса пропущена:", e instanceof Error ? e.message : e));
+
+  console.log("Готово. Если не ставил сервис — запусти вручную: bun run service\n");
   process.exit(code);
 }
 

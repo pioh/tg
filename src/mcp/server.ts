@@ -25,7 +25,7 @@ function failResult(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-const server = new McpServer({ name: "tg", version: "0.3.0" });
+const server = new McpServer({ name: "tg", version: "0.4.0" });
 
 // Прокси-обёртка: инструмент пересылает свои аргументы в хаб как операцию `op`.
 function proxy(name: string, cfg: unknown, op: string): void {
@@ -115,7 +115,9 @@ proxy(
   { title: "Изменить монитор", description: "Включить/выключить или поменять параметры.", inputSchema: { id: z.string(), enabled: z.boolean().optional(), action: z.enum(["notify", "draft", "reply"]).optional(), min_interval_sec: z.number().int().min(0).optional(), only_if_owner_silent_sec: z.number().int().min(0).optional() } },
   "monitor_update",
 );
-proxy("monitor_poll", { title: "Опросить мониторы", description: "Сработавшие мониторы (прошедшие троттлинг и проверку «владелец молчит»).", inputSchema: {} }, "monitor_poll");
+// monitor_poll НЕ публикуется как инструмент: опрос двигает курсоры мониторов, это
+// делает САМ сервис (live-цикл). Интерактивный агент получает сработки как события —
+// иначе он украл бы событие у живого сервиса. То же для schedule_poll.
 
 // ===== Разрешения на отправку (code-level allowlist) =====
 proxy("permission_list", { title: "Кому можно писать", description: "Чаты с явным разрешением на отправку (кроме «me» и управляющего канала — им можно всегда).", inputSchema: {} }, "permission_list");
@@ -125,15 +127,21 @@ proxy("permission_revoke", { title: "Отозвать разрешение", des
 // ===== Бот =====
 proxy("bot_status", { title: "Статус бота", description: "Настроен ли сервисный бот, @username, ссылка.", inputSchema: {} }, "bot_status");
 proxy("bot_set_token", { title: "Сохранить токен бота", description: "Сохранить токен от @BotFather (создание: /newbot через tg_send_message, см. rules/25-bot).", inputSchema: { token: z.string() } }, "bot_set_token");
-proxy("bot_send", { title: "Бот пишет человеку", description: "ФИНАЛЬНЫЙ ответ от имени бота (по умолч. владельцу). Длинные сообщения сервис сам бьёт на части.", inputSchema: { text: z.string().min(1), chat_id: z.number().int().optional() } }, "bot_send");
-proxy("bot_progress", { title: "Промежуточный статус бота", description: "Стилизованное «что делаю» (💭) — чтобы человек видел, что идёт работа. Используй для долгих задач; финал — через bot_send.", inputSchema: { text: z.string().min(1), chat_id: z.number().int().optional() } }, "bot_progress");
+// Обычный ответ человеку НЕ требует bot_send: текстовый вывод агента сервис сам шлёт
+// человеку (MarkdownV2). bot_send нужен лишь для конкретного chat_id или проактивно.
+proxy("bot_send", { title: "Бот пишет в конкретный чат", description: "Отправить сообщение бота в конкретный chat_id или проактивно (по расписанию). Для обычного ответа НЕ нужен — просто выведи текст. MarkdownV2; длинное режется само.", inputSchema: { text: z.string().min(1), chat_id: z.number().int().optional() } }, "bot_send");
 proxy("bot_react", { title: "Реакция бота на сообщение", description: "Эмодзи-реакция на сообщение в чате бота (👀 = «увидел»).", inputSchema: { chat_id: z.number().int(), message_id: z.number().int(), emoji: z.string().optional() } }, "bot_react");
+
+// ===== Кто может писать боту (allowlist; по умолчанию только владелец) =====
+proxy("bot_users_list", { title: "Кто может писать боту", description: "Список пользователей (помимо владельца), которым разрешено писать сервисному боту.", inputSchema: {} }, "bot_users_list");
+proxy("bot_user_allow", { title: "Разрешить писать боту", description: "Разрешить пользователю (id или @username) писать сервисному боту. Только по явной просьбе владельца.", inputSchema: { user: z.string(), note: z.string().optional() } }, "bot_user_allow");
+proxy("bot_user_deny", { title: "Запретить писать боту", description: "Убрать пользователя из списка разрешённых писать боту.", inputSchema: { user: z.string() } }, "bot_user_deny");
 
 // ===== Расписания =====
 proxy("schedule_add", { title: "Создать расписание", description: "Периодическая задача: каждые every_sec выполнять instruction, доставлять deliver (bot/saved). Только по явной просьбе.", inputSchema: { name: z.string(), every_sec: z.number().int().min(30), instruction: z.string(), deliver: z.enum(["bot", "saved"]).optional() } }, "schedule_add");
 proxy("schedule_list", { title: "Список расписаний", description: "Все расписания.", inputSchema: {} }, "schedule_list");
 proxy("schedule_remove", { title: "Удалить расписание", description: "Удалить по id.", inputSchema: { id: z.string() } }, "schedule_remove");
-proxy("schedule_poll", { title: "Опросить расписания", description: "Созревшие задачи (пора выполнить).", inputSchema: {} }, "schedule_poll");
+// schedule_poll НЕ публикуется (двигает lastRunAt) — созревшие задачи отдаёт сервис как события.
 
 // ===== Сессия агента (контекст) =====
 proxy("session_status", { title: "Контекст/расход сессии", description: "Текущий размер контекста, число ходов и расход токенов/стоимость текущей сессии агента.", inputSchema: {} }, "session_status");

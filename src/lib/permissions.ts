@@ -73,3 +73,19 @@ export async function revokePermission(peerId: number): Promise<boolean> {
   await save(data);
   return true;
 }
+
+/** Убирает все разрешения, выданные конкретным источником (например "monitor:m3").
+ *  Нужно, чтобы при выключении/удалении монитора «выключено» реально означало
+ *  выключено, а не оставляло висящее разрешение на отправку. Возвращает число снятых. */
+export async function revokeBySource(source: string): Promise<number> {
+  const data = await load();
+  let n = 0;
+  for (const [k, v] of Object.entries(data.chats)) {
+    if (v.source === source) {
+      delete data.chats[k];
+      n++;
+    }
+  }
+  if (n) await save(data);
+  return n;
+}

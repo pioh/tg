@@ -73,7 +73,8 @@ export async function createCodexEngine(opts: CodexEngineOpts): Promise<CodexEng
       ...(reasoning ? { modelReasoningEffort: reasoning as "minimal" | "low" | "medium" | "high" | "xhigh" } : {}),
       workingDirectory: REPO_ROOT,
       skipGitRepoCheck: true,
-      sandboxMode: "workspace-write" as const,
+      // Полный доступ без подтверждений (личный локальный инструмент владельца).
+      sandboxMode: "danger-full-access" as const,
       approvalPolicy: "never" as const,
       networkAccessEnabled: true,
     };
@@ -105,7 +106,7 @@ export async function createCodexEngine(opts: CodexEngineOpts): Promise<CodexEng
           "--cd",
           REPO_ROOT,
           "--sandbox",
-          "workspace-write",
+          "danger-full-access",
           "--skip-git-repo-check",
           "-c",
           `approval_policy="never"`,

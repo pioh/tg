@@ -8,18 +8,27 @@ import { atomicWriteJson } from "./atomic.ts";
 export type AgentEngine = "claude" | "codex";
 
 export const ENGINES: readonly AgentEngine[] = ["claude", "codex"] as const;
-export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+// У движков РАЗНЫЕ наборы уровней усилия:
+//   Claude: low|medium|high|xhigh|max
+//   Codex:  minimal|low|medium|high|xhigh (нет "max")
+// EFFORT_LEVELS — объединение (для хранения в конфиге), normalizeEffort валидирует
+// под конкретный движок.
+export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export const CODEX_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
+export const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 export function isEngine(v: unknown): v is AgentEngine {
   return v === "claude" || v === "codex";
 }
 
-/** Приводит уровень усилия к валидному enum или бросает понятную ошибку. */
-export function normalizeEffort(v: string): EffortLevel {
+/** Приводит уровень усилия к валидному для движка значению или бросает понятную ошибку. */
+export function normalizeEffort(v: string, engine: AgentEngine = "claude"): EffortLevel {
   const e = v.trim().toLowerCase();
-  if ((EFFORT_LEVELS as readonly string[]).includes(e)) return e as EffortLevel;
-  throw new Error(`Неверный effort "${v}". Допустимо: ${EFFORT_LEVELS.join(", ")}.`);
+  const allowed = (engine === "codex" ? CODEX_EFFORTS : CLAUDE_EFFORTS) as readonly string[];
+  if (allowed.includes(e)) return e as EffortLevel;
+  throw new Error(`Неверный effort "${v}" для движка ${engine}. Допустимо: ${allowed.join(", ")}.`);
 }
 
 export interface Config {

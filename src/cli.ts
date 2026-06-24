@@ -18,6 +18,8 @@ import { serviceRunning } from "./lib/lock.ts";
 import { hubCall } from "./lib/rpc.ts";
 import { listPermissions, revokePermission } from "./lib/permissions.ts";
 import { ensureDataLayout, readHandoff, recordQa } from "./lib/memory.ts";
+import { installService, uninstallService, serviceDocs } from "./lib/service-install.ts";
+import { currentVersion, checkForUpdate, applyUpdate } from "./lib/update.ts";
 
 function spawnBun(file: string, args: string[] = []): Promise<number> {
   const proc = Bun.spawn(["bun", "run", file, ...args], {
@@ -164,6 +166,41 @@ async function permissionsCmd(rest: string[]): Promise<void> {
   process.exit(1);
 }
 
+async function installServiceCmd(): Promise<void> {
+  const running = await serviceRunning();
+  // Если экземпляр уже работает вручную — только включаем (не стартуем второй).
+  const res = await installService(!running);
+  console.log("");
+  for (const m of res.messages) console.log("  " + m);
+  if (running) console.log("  ⚠️ Сейчас запущен ручной экземпляр — остановите его (Ctrl+C), сервис подхватит автозапуск.");
+  console.log("\n" + res.docs + "\n");
+}
+
+async function uninstallServiceCmd(): Promise<void> {
+  const res = await uninstallService();
+  console.log("");
+  for (const m of res.messages) console.log("  " + m);
+  console.log("");
+}
+
+async function versionCmd(): Promise<void> {
+  console.log(`tg ${await currentVersion()}`);
+  const ch = await checkForUpdate();
+  if (!ch.ok) console.log(`(не удалось проверить обновления: ${ch.error})`);
+  else if (ch.hasUpdate) console.log(`🆕 Доступна версия ${ch.latest}. Обновить: bun run tg update`);
+  else console.log("✅ Установлена последняя версия.");
+}
+
+async function updateCmd(): Promise<void> {
+  console.log("Обновляю (git pull + bun install)…");
+  const r = await applyUpdate();
+  if (!r.ok) {
+    console.error("❌ " + r.error);
+    process.exit(1);
+  }
+  console.log(`✅ Обновлено до ${r.version}. Перезапусти сервис, чтобы применить (если запущен): systemctl --user restart tg-agent / launchctl … / Ctrl+C + bun run service.`);
+}
+
 function help(): void {
   console.log(
     `tg — ИИ-агент для личного Telegram\n\n` +
@@ -171,6 +208,11 @@ function help(): void {
       `  setup                 мастер настройки (вход + бот + базовое) — начните с него\n` +
       `  login                 интерактивный вход в Telegram\n` +
       `  service [--once]       запустить агента-сервис (--once — один проход)\n` +
+      `  install-service       поставить как фоновый сервис (systemd/launchd) + автозапуск\n` +
+      `  uninstall-service     удалить фоновый сервис\n` +
+      `  service-help          как смотреть логи / останавливать / перезапускать сервис\n` +
+      `  version               версия + проверка обновлений\n` +
+      `  update                обновиться до последней версии (git pull + bun install)\n` +
       `  mcp                   запустить MCP-сервер вручную\n` +
       `  doctor [--prepublish] проверить окружение (или готовность к публикации)\n` +
       `  permissions [list|revoke <chat>]  разрешения на отправку\n` +
@@ -191,6 +233,24 @@ async function main(): Promise<void> {
       break;
     case "service":
       process.exit(await spawnBun(join("src", "service.ts"), rest));
+      break;
+    case "install-service":
+      await installServiceCmd();
+      break;
+    case "uninstall-service":
+      await uninstallServiceCmd();
+      break;
+    case "service-help":
+    case "service-docs":
+      console.log("\n" + serviceDocs() + "\n");
+      break;
+    case "version":
+    case "--version":
+    case "-v":
+      await versionCmd();
+      break;
+    case "update":
+      await updateCmd();
       break;
     case "mcp":
       process.exit(await spawnBun(MCP_SERVER_PATH));

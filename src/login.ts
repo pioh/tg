@@ -28,6 +28,56 @@ function ask(question: string): string {
   return ans.trim();
 }
 
+// Ввод секрета (пароль 2FA) со СКРЫТИЕМ: вместо символов печатаются звёздочки, чтобы
+// пароль не светился в терминале/в истории/в плече соседа. Работает в raw-режиме TTY;
+// в неинтерактивном режиме (пайп) откатывается на обычный ввод (эхо не отключить).
+function askHidden(question: string): Promise<string> {
+  const stdin = process.stdin;
+  // Нет TTY или нет raw-режима (некоторые окружения/Windows-консоли) — откатываемся на
+  // обычный ввод (без скрытия эхо это не сделать кроссплатформенно).
+  if (!stdin.isTTY || typeof stdin.setRawMode !== "function") return Promise.resolve(ask(question));
+  process.stdout.write(question);
+  return new Promise<string>((resolve) => {
+    let buf = "";
+    const prevRaw = Boolean(stdin.isRaw);
+    stdin.setRawMode(true);
+    stdin.resume();
+    const finish = (restorePause: boolean) => {
+      stdin.setRawMode(prevRaw);
+      if (restorePause) stdin.pause();
+      stdin.removeListener("data", onData);
+    };
+    const onData = (data: Buffer) => {
+      for (const ch of data.toString("utf8")) {
+        if (ch === "\r" || ch === "\n") {
+          finish(true);
+          process.stdout.write("\n");
+          resolve(buf.trim());
+          return;
+        }
+        if (ch === "") {
+          // Ctrl+C
+          finish(false);
+          process.stdout.write("\n");
+          process.exit(1);
+        }
+        if (ch === "" || ch === "\b") {
+          // Backspace / Delete
+          if (buf.length > 0) {
+            buf = buf.slice(0, -1);
+            process.stdout.write("\b \b");
+          }
+          continue;
+        }
+        if (ch < " ") continue; // прочие управляющие символы игнорируем
+        buf += ch;
+        process.stdout.write("*");
+      }
+    };
+    stdin.on("data", onData);
+  });
+}
+
 // sendCode может вернуть User (если вход уже не требуется) — тогда сразу завершаем.
 function requireSentCode(r: SentCode | User): SentCode {
   if ("phoneCodeHash" in r) return r;
@@ -117,7 +167,7 @@ async function loginByCode(tg: TelegramClient): Promise<User> {
 
 async function askPassword(tg: TelegramClient): Promise<User> {
   for (;;) {
-    const pwd = ask("Облачный пароль (2FA): ");
+    const pwd = await askHidden("Облачный пароль (2FA): ");
     try {
       return await tg.checkPassword(pwd);
     } catch (pe) {
@@ -142,7 +192,7 @@ async function loginByQr(tg: TelegramClient): Promise<User> {
       console.log("↑ Отсканируйте этот QR в Telegram (обновляется автоматически).\n");
     },
     onQrScanned: () => console.log("QR отсканирован, завершаю вход…"),
-    password: () => ask("Облачный пароль (2FA): "),
+    password: () => askHidden("Облачный пароль (2FA): "),
     invalidPasswordCallback: () => {
       console.log("Неверный пароль 2FA, попробуйте ещё раз.");
     },

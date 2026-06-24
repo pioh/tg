@@ -1,15 +1,19 @@
 import "./_env.ts";
 import { test, expect } from "bun:test";
 import { join } from "node:path";
-import { normalizeEffort, isEngine, EFFORT_LEVELS } from "../src/lib/config.ts";
+import { normalizeEffort, isEngine, CLAUDE_EFFORTS, CODEX_EFFORTS } from "../src/lib/config.ts";
 import { redact, redactToString } from "../src/lib/redact.ts";
 import { atomicWrite, atomicWriteJson } from "../src/lib/atomic.ts";
 import { TEST_DATA_DIR } from "./_env.ts";
 
-test("normalizeEffort нормализует регистр и валидирует", () => {
+test("normalizeEffort нормализует регистр и валидирует по движку", () => {
   expect(normalizeEffort("HIGH")).toBe("high");
-  for (const e of EFFORT_LEVELS) expect(normalizeEffort(e)).toBe(e);
+  for (const e of CLAUDE_EFFORTS) expect(normalizeEffort(e, "claude")).toBe(e);
+  for (const e of CODEX_EFFORTS) expect(normalizeEffort(e, "codex")).toBe(e);
   expect(() => normalizeEffort("turbo")).toThrow();
+  // "max" — только Claude; "minimal" — только Codex.
+  expect(() => normalizeEffort("max", "codex")).toThrow();
+  expect(() => normalizeEffort("minimal", "claude")).toThrow();
 });
 
 test("isEngine — только claude/codex", () => {

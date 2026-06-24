@@ -14,6 +14,7 @@ import { redactToString } from "./lib/redact.ts";
 import * as tgOps from "./telegram/ops.ts";
 import * as monitors from "./lib/monitors.ts";
 import * as bot from "./lib/bot.ts";
+import * as botusers from "./lib/botusers.ts";
 import * as schedules from "./lib/schedules.ts";
 import * as permissions from "./lib/permissions.ts";
 import {
@@ -206,8 +207,11 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
     },
 
     // --- Мониторы ---
-    monitor_add: async (a) => {
-      const m = await monitors.addMonitor(tg, {
+    // Разрешение на отправку в чат монитора НЕ выдаётся отдельно: assertCanSend сам
+    // пускает отправку в чат ВКЛЮЧЁННОГО монитора action=reply. Поэтому «выключил
+    // монитор» = «отправка туда снова запрещена» автоматически, без висящих грантов.
+    monitor_add: async (a) =>
+      monitors.addMonitor(tg, {
         name: a.name,
         chat: a.chat,
         topicId: a.topic_id,
@@ -218,21 +222,15 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
         action: a.action,
         minIntervalSec: a.min_interval_sec,
         onlyIfOwnerSilentSec: a.only_if_owner_silent_sec,
-      });
-      // Монитор action=reply создаётся ЯВНО человеком → выдаём разрешение на отправку.
-      if (m.action === "reply") {
-        try {
-          await permissions.grantPermission(await peerId(m.chat), { label: m.name, source: `monitor:${m.id}` });
-        } catch {
-          /* разрешение можно выдать позже permission_grant */
-        }
-      }
-      return m;
-    },
+      }),
     monitor_list: () => monitors.listMonitors(),
-    monitor_remove: async (a) => ({ removed: await monitors.removeMonitor(a.id) }),
-    monitor_update: (a) =>
-      monitors.updateMonitor(
+    monitor_remove: async (a) => {
+      const removed = await monitors.removeMonitor(a.id);
+      if (removed) await permissions.revokeBySource(`monitor:${a.id}`); // снять легаси-грант
+      return { removed };
+    },
+    monitor_update: async (a) => {
+      const m = await monitors.updateMonitor(
         a.id,
         omitUndefined({
           enabled: a.enabled,
@@ -240,7 +238,11 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
           minIntervalSec: a.min_interval_sec,
           onlyIfOwnerSilentSec: a.only_if_owner_silent_sec,
         }),
-      ),
+      );
+      // Если монитор больше не «включённый reply» — снять легаси-грант, выданный им.
+      if (m && (!m.enabled || m.action !== "reply")) await permissions.revokeBySource(`monitor:${m.id}`);
+      return m;
+    },
     monitor_poll: async () => monitors.evaluateMonitors(tg, Date.now()),
 
     // --- Разрешения на отправку (code-level allowlist) ---
@@ -261,6 +263,18 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
     bot_poll: async (a) => botSerial(async () => bot.botPoll(await meIdP, a.timeout ?? 0)),
     bot_send: (a) => bot.botSend(a.text, a.chat_id),
     bot_progress: (a) => bot.botProgress(a.text, a.chat_id),
+    bot_typing: (a) => bot.botTyping(a.chat_id),
+
+    // --- Кто может писать боту (allowlist; по умолчанию только владелец) ---
+    bot_users_list: () => botusers.listBotUsers(),
+    bot_user_allow: async (a) => {
+      const uid = /^-?\d+$/.test(String(a.user)) ? Number(a.user) : await peerId(String(a.user));
+      return botusers.allowBotUser(uid, { note: a.note });
+    },
+    bot_user_deny: async (a) => {
+      const uid = /^-?\d+$/.test(String(a.user)) ? Number(a.user) : await peerId(String(a.user));
+      return { removed: await botusers.denyBotUser(uid) };
+    },
 
     // --- Сессия агента (контекст) ---
     session_status: async () => ({

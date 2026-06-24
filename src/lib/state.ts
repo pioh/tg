@@ -26,6 +26,8 @@ export interface ServiceState {
   codexThreadId?: string;
   /** накопленный расход текущей сессии агента. */
   agentUsage?: AgentUsage;
+  /** версия, про которую уже уведомили владельца (чтобы не спамить про обновление). */
+  notifiedUpdateVersion?: string;
 }
 
 const EMPTY: ServiceState = { controlCursor: {} };

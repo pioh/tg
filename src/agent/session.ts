@@ -101,7 +101,9 @@ function createClaudeSession(opts: SessionOpts): AgentSession {
       model: opts.model,
       ...(opts.effort ? { effort: opts.effort as "low" | "medium" | "high" | "xhigh" | "max" } : {}),
       cwd: REPO_ROOT,
-      permissionMode: "dontAsk",
+      // Полные права без подтверждений (как Claude Code с --dangerously-skip-permissions):
+      // все инструменты, включая Bash. Это личный локальный инструмент владельца.
+      permissionMode: "bypassPermissions",
       settingSources: [],
       ...(opts.resume ? { resume: opts.resume } : {}),
       systemPrompt: { type: "preset", preset: "claude_code", append: opts.append },
@@ -113,8 +115,6 @@ function createClaudeSession(opts: SessionOpts): AgentSession {
           env: { TG_HUB_PORT: String(opts.hubPort), TG_HUB_TOKEN: opts.hubToken },
         },
       },
-      allowedTools: ["Read", "Write", "Edit", "Glob", "Grep", "mcp__telegram"],
-      disallowedTools: ["Bash"],
     },
   });
 
