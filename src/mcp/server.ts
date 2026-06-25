@@ -26,7 +26,7 @@ function failResult(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-const server = new McpServer({ name: "tg", version: "0.7.0" });
+const server = new McpServer({ name: "tg", version: "0.7.1" });
 
 // Координаты хаба переданы сервисом ЯВНО в env (live-MCP для агента) — тенант уже
 // зафиксирован, set_context не нужен.

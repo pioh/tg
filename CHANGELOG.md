@@ -11,6 +11,15 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-25
+
+### Fixed
+- **Само-восстановление lock после ПЕРЕЗАГРУЗКИ машины**: `serviceRunning` считает lock
+  живым только если отвечает хаб ИЛИ pid жив И lock свежий (≤60с, окно старта). Раньше
+  после ребута pid из `service.lock` мог быть переиспользован чужим процессом
+  (`pidAlive=true`) → сервис ложно «уже запущен» → крэш-цикл. Теперь старый lock
+  распознаётся как stale и перезахватывается. (+ регресс-тест)
+
 ## [0.7.0] - 2026-06-25
 
 Плавный UX мультитенанта по `spec/it6.txt`. Сделано воркфлоу-агентами + перекрёстное ревью
@@ -160,7 +169,8 @@
   Claude Code / Codex, дисковая память (handoff/progress/qa/rules), мониторы,
   расписания, сервисный бот, RPC-хаб с bearer-токеном, lock единственного сервиса.
 
-[Unreleased]: https://github.com/pioh/tg/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/pioh/tg/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/pioh/tg/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/pioh/tg/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pioh/tg/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/pioh/tg/compare/v0.5.0...v0.5.1

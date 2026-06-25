@@ -49,12 +49,22 @@ async function hubHealthy(port: number): Promise<boolean> {
 }
 
 /** Жив ли уже запущенный сервис (по lock-файлу). */
+// Сколько секунд считать lock «свежим» по pid, пока хаб ещё не отвечает (окно старта).
+const LOCK_STARTUP_GRACE_MS = 60000;
+
 export async function serviceRunning(): Promise<LockInfo | null> {
   const lock = await readLock();
   if (!lock) return null;
+  // Надёжный признак «живой» — отвечает хаб на его порту.
   if (await hubHealthy(lock.port)) return lock;
-  if (pidAlive(lock.pid)) return lock; // процесс есть, но хаб ещё не поднялся
-  return null; // stale
+  // Хаб не отвечает: считаем «запускается» ТОЛЬКО если pid жив И lock СВЕЖИЙ. Иначе это
+  // stale (частый случай после ПЕРЕЗАГРУЗКИ: pid из lock переиспользован чужим процессом —
+  // pidAlive=true, но это не наш сервис). Свежесть отсекает такие ложные срабатывания.
+  const ageMs = Date.now() - Date.parse(lock.startedAt);
+  if (pidAlive(lock.pid) && Number.isFinite(ageMs) && ageMs >= 0 && ageMs < LOCK_STARTUP_GRACE_MS) {
+    return lock; // наш процесс ещё поднимает хаб
+  }
+  return null; // stale — можно перезахватить
 }
 
 function randomToken(): string {
