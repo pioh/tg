@@ -1,6 +1,7 @@
-// Один сервис — один владелец Telegram-сессии. Здесь реализован процессный lock и
-// рантайм-координаты хаба: pid, порт RPC и случайный bearer-токен. Файл лежит в
-// data/service.lock (личные данные, не в git), пишется с правами 600.
+// Один сервис — один владелец Telegram-сессии (на каждого тенанта). Здесь реализован
+// процессный lock и рантайм-координаты хаба: pid, порт RPC и случайный bearer-токен.
+// Файл лежит в рабочей папке ТЕКУЩЕГО тенанта: tenants/<имя>/service.lock (lockPath()),
+// личные данные, не в git, пишется с правами 600.
 //
 // Зачем токен: hub слушает 127.0.0.1, но без авторизации ЛЮБОЙ локальный процесс мог
 // бы дёрнуть send_message/bot_send и т.п. Bearer-токен в файле с правами 600 закрывает
@@ -69,16 +70,24 @@ function alreadyRunning(lock: LockInfo): Error {
 }
 
 /**
- * Захватывает lock для сервиса. Если живой сервис уже есть — кидает ошибку
- * (нельзя два владельца сессии). Stale-lock перезаписывается. Создаётся АТОМАРНО
- * (open "wx" = O_CREAT|O_EXCL) с правами 600 — закрывает гонку двух одновременных
- * стартов и не светит токен другим пользователям. Возвращает токен/порт.
+ * Готовит координаты сервиса (pid/port/token), НЕ записывая lock на диск. Если живой
+ * сервис уже есть — кидает ошибку (нельзя два владельца сессии). Используется, чтобы
+ * получить токен ДО старта хаба, а сам lock записать только ПОСЛЕ успешного бинда
+ * (writeLock) — иначе возникает окно, когда lock уже есть, а хаб ещё не слушает.
  */
-export async function acquireLock(port: number): Promise<LockInfo> {
+export async function prepareLock(port: number): Promise<LockInfo> {
   const running = await serviceRunning();
   if (running) throw alreadyRunning(running);
+  return { pid: process.pid, port, token: randomToken(), startedAt: new Date().toISOString() };
+}
 
-  const info: LockInfo = { pid: process.pid, port, token: randomToken(), startedAt: new Date().toISOString() };
+/**
+ * Записывает lock АТОМАРНО (open "wx" = O_CREAT|O_EXCL) с правами 600 — закрывает гонку
+ * двух одновременных стартов и не светит токен другим пользователям. Звать ПОСЛЕ того,
+ * как хаб реально слушает порт (см. prepareLock): так потребитель никогда не схватит
+ * lock с портом/токеном ещё не поднятого хаба.
+ */
+export async function writeLock(info: LockInfo): Promise<void> {
   const data = JSON.stringify(info, null, 2) + "\n";
   const path = lockPath();
   await mkdir(dirname(path), { recursive: true });
@@ -96,12 +105,22 @@ export async function acquireLock(port: number): Promise<LockInfo> {
     await writeExclusive();
   } catch (e) {
     if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
-    // lock появился между проверкой и созданием — это либо живой сервис, либо stale
+    // lock появился между prepareLock и записью — это либо живой сервис, либо stale.
     const again = await serviceRunning();
     if (again) throw alreadyRunning(again);
     await unlink(path).catch(() => {});
     await writeExclusive();
   }
+}
+
+/**
+ * Захватывает lock для сервиса одним вызовом (проверка + запись). Оставлен для случаев,
+ * где хаб поднимать не нужно. Когда поднимается хаб, используйте prepareLock + writeLock,
+ * чтобы lock на диске появился только ПОСЛЕ успешного бинда.
+ */
+export async function acquireLock(port: number): Promise<LockInfo> {
+  const info = await prepareLock(port);
+  await writeLock(info);
   return info;
 }
 

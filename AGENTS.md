@@ -7,9 +7,12 @@ Codex и Claude Code), а не в этом файле.
 
 1. `rules/00-agent-core.md` — кто ты и доктрина «память на диске».
 2. `rules/10-memory-hierarchy.md` — структура памяти и как её вести.
-3. Загрузи память: вызови MCP-инструмент `mem_bootstrap` (правила + `data/handoff.md`
+3. Выбери пользователя: MCP-инструмент `list_tenants`, затем `set_context(<имя>)`. Без
+   этого остальные MCP-инструменты (включая `mem_bootstrap`) вернут ошибку (намеренно —
+   никаких скрытых дефолтов/авто-выбора тенанта).
+4. Загрузи память: вызови MCP-инструмент `mem_bootstrap` (правила + `data/handoff.md`
    + свежие `data/qa` + хвост `data/progress.txt`).
-4. Остальное: `rules/20-telegram-tools.md`, `rules/30-chat-handling.md`,
+5. Остальное: `rules/20-telegram-tools.md`, `rules/30-chat-handling.md`,
    `rules/40-reply-style.md`, `rules/50-safety.md`.
 
 ## Где что менять

@@ -12,7 +12,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { log } from "../lib/log.ts";
-import { hubCall } from "../lib/rpc.ts";
+import { hubCall, getRpcTenant, setRpcTenant } from "../lib/rpc.ts";
+import { listTenants, tenantExists } from "../lib/tenants.ts";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 type ToolResult = { content: ContentBlock[]; isError?: boolean };
@@ -25,18 +26,70 @@ function failResult(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-const server = new McpServer({ name: "tg", version: "0.6.0" });
+const server = new McpServer({ name: "tg", version: "0.7.0" });
+
+// Координаты хаба переданы сервисом ЯВНО в env (live-MCP для агента) — тенант уже
+// зафиксирован, set_context не нужен.
+function hubFromEnv(): boolean {
+  return Boolean(process.env.TG_HUB_PORT && process.env.TG_HUB_TOKEN);
+}
+
+// Гейт контекста: пока тенант не выбран (и нет env-координат хаба), любой рабочий
+// инструмент возвращает понятную ошибку со списком доступных тенантов. БЕЗ авто-выбора.
+async function requireContext(): Promise<void> {
+  if (hubFromEnv() || getRpcTenant()) return;
+  const names = await listTenants();
+  const list = names.length ? names.join(", ") : "(пока нет — создай: bun run tg setup <имя>)";
+  throw new Error(`Сначала вызови set_context(<имя>). Доступные: ${list}`);
+}
 
 // Прокси-обёртка: инструмент пересылает свои аргументы в хаб как операцию `op`.
 function proxy(name: string, cfg: unknown, op: string): void {
   (server.registerTool as any)(name, cfg, async (args: Record<string, unknown> = {}) => {
     try {
+      await requireContext();
       return ok(await hubCall(op, args));
     } catch (e) {
       return failResult(`Ошибка: ${e instanceof Error ? e.message : String(e)}`);
     }
   });
 }
+
+// ===== Контекст тенанта (технические инструменты — БЕЗ гейта requireContext) =====
+(server.registerTool as any)(
+  "list_tenants",
+  { title: "Список пользователей (тенантов)", description: "Имена рабочих папок tenants/<имя>. Нужно для set_context.", inputSchema: {} },
+  async (): Promise<ToolResult> => {
+    try {
+      const names = await listTenants();
+      const current = getRpcTenant();
+      return ok({ tenants: names, current: current ?? null });
+    } catch (e) {
+      return failResult(`Ошибка: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  },
+);
+(server.registerTool as any)(
+  "set_context",
+  {
+    title: "Выбрать пользователя (тенанта)",
+    description: "Задать ТЕКУЩЕГО тенанта для этой MCP-сессии (один раз). Без него прочие инструменты не работают. Авто-выбора нет — укажи имя явно (см. list_tenants).",
+    inputSchema: { tenant: z.string().min(1) },
+  },
+  async ({ tenant }: { tenant: string }): Promise<ToolResult> => {
+    try {
+      if (!(await tenantExists(tenant))) {
+        const names = await listTenants();
+        const list = names.length ? names.join(", ") : "(пока нет)";
+        return failResult(`Тенант «${tenant}» не найден. Доступные: ${list}`);
+      }
+      setRpcTenant(tenant);
+      return ok({ ok: true, tenant, note: "Контекст установлен. Теперь доступны остальные инструменты." });
+    } catch (e) {
+      return failResult(`Ошибка: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  },
+);
 
 // ===== Telegram =====
 proxy("tg_whoami", { title: "Кто я в Telegram", description: "Аккаунт: id, имя, username, телефон.", inputSchema: {} }, "whoami");
@@ -53,7 +106,7 @@ proxy(
 );
 proxy(
   "tg_send_message",
-  { title: "Отправить сообщение", description: "Текст от имени пользователя. Третьим лицам — только если разрешено правилом (rules/50). Себе — chat \"me\".", inputSchema: { chat: z.string(), text: z.string().min(1), reply_to: z.number().int().optional() } },
+  { title: "Отправить сообщение", description: "Текст от имени пользователя в любой чат. Себе — chat \"me\". По умолчанию агент пассивен: пиши третьим лицам только по явной просьбе/правилу (rules/50).", inputSchema: { chat: z.string(), text: z.string().min(1), reply_to: z.number().int().optional() } },
   "send_message",
 );
 proxy("tg_search", { title: "Поиск сообщений", description: "Поиск в чате (chat) или глобально.", inputSchema: { query: z.string().min(1), chat: z.string().optional(), limit: z.number().int().min(1).max(100).optional() } }, "search");
@@ -74,6 +127,7 @@ proxy("tg_react", { title: "Реакция на сообщение", description
   { title: "Посмотреть/скачать медиа", description: "Скачать медиа; для фото/картинок вернуть ИНЛАЙН (модель видит). Иначе — путь и метаданные.", inputSchema: { chat: z.string(), message_id: z.number().int() } },
   async ({ chat, message_id }: { chat: string; message_id: number }): Promise<ToolResult> => {
     try {
+      await requireContext();
       const r = await hubCall<{ kind: string; path: string; fileName: string | null; note?: string; image?: { base64: string; mimeType: string } }>(
         "view_media",
         { chat, message_id },
@@ -119,17 +173,15 @@ proxy(
 // делает САМ сервис (live-цикл). Интерактивный агент получает сработки как события —
 // иначе он украл бы событие у живого сервиса. То же для schedule_poll.
 
-// ===== Разрешения на отправку (code-level allowlist) =====
-proxy("permission_list", { title: "Кому можно писать", description: "Чаты с явным разрешением на отправку (кроме «me» и управляющего канала — им можно всегда).", inputSchema: {} }, "permission_list");
-proxy("permission_grant", { title: "Разрешить писать в чат", description: "Выдать разрешение отвечать в чат. ТОЛЬКО по явной просьбе владельца.", inputSchema: { chat: z.string(), label: z.string().optional(), source: z.string().optional() } }, "permission_grant");
-proxy("permission_revoke", { title: "Отозвать разрешение", description: "Запретить отправку в чат (убрать из allowlist).", inputSchema: { chat: z.string() } }, "permission_revoke");
+// Разрешений на отправку (permission_grant/list/revoke) больше нет: отправка свободна
+// в любой чат. См. rules/50-safety.md и комментарий в src/hub.ts.
 
 // ===== Бот =====
 proxy("bot_status", { title: "Статус бота", description: "Настроен ли сервисный бот, @username, ссылка.", inputSchema: {} }, "bot_status");
 proxy("bot_set_token", { title: "Сохранить токен бота", description: "Сохранить токен от @BotFather (создание: /newbot через tg_send_message, см. rules/25-bot).", inputSchema: { token: z.string() } }, "bot_set_token");
 // Обычный ответ человеку НЕ требует bot_send: текстовый вывод агента сервис сам шлёт
-// человеку (MarkdownV2). bot_send нужен лишь для конкретного chat_id или проактивно.
-proxy("bot_send", { title: "Бот пишет в конкретный чат", description: "Отправить сообщение бота в конкретный chat_id или проактивно (по расписанию). Для обычного ответа НЕ нужен — просто выведи текст. MarkdownV2; длинное режется само.", inputSchema: { text: z.string().min(1), chat_id: z.number().int().optional() } }, "bot_send");
+// человеку. bot_send нужен лишь для конкретного chat_id или проактивно.
+proxy("bot_send", { title: "Бот пишет в конкретный чат", description: "Отправить сообщение бота в конкретный chat_id или проактивно (по расписанию). Для обычного ответа НЕ нужен — просто выведи текст. Пиши обычным Markdown — сервис сам конвертирует в Telegram-HTML; длинное режется само.", inputSchema: { text: z.string().min(1), chat_id: z.number().int().optional() } }, "bot_send");
 proxy("bot_react", { title: "Реакция бота на сообщение", description: "Эмодзи-реакция на сообщение в чате бота (👀 = «увидел»).", inputSchema: { chat_id: z.number().int(), message_id: z.number().int(), emoji: z.string().optional() } }, "bot_react");
 
 // ===== Кто может писать боту (allowlist; по умолчанию только владелец) =====

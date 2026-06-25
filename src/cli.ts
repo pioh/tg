@@ -16,15 +16,13 @@ import { loadConfig } from "./lib/config.ts";
 import { isLoggedIn } from "./telegram/client.ts";
 import { serviceRunning } from "./lib/lock.ts";
 import { hubCall } from "./lib/rpc.ts";
-import { listPermissions, revokePermission } from "./lib/permissions.ts";
 import { ensureDataLayout, readHandoff, recordQa } from "./lib/memory.ts";
 import { installService, uninstallService, serviceDocs } from "./lib/service-install.ts";
 import { currentVersion, checkForUpdate, applyUpdate } from "./lib/update.ts";
 import { autoMigrateLegacy, createTenant, listTenants, migrateLegacy, tenantContext, tenantExists, withTenant } from "./lib/tenants.ts";
 
-// Выбор тенанта для команд, работающих с рабочей папкой. Если имя задано первым
-// аргументом и совпадает с существующим — берём его (и убираем из rest). Иначе: один
-// тенант — берём его; несколько — просим указать имя; ноль — ошибка.
+// Выбор тенанта для команд, работающих с рабочей папкой. Имя ОБЯЗАТЕЛЬНО задаётся
+// первым аргументом — НИКАКОГО авто-выбора единственного тенанта (это скрытый дефолт).
 async function cliTenant(rest: string[]): Promise<{ ctx: TenantContext; rest: string[] }> {
   const names = await listTenants();
   if (names.length === 0) {
@@ -34,8 +32,7 @@ async function cliTenant(rest: string[]): Promise<{ ctx: TenantContext; rest: st
   if (rest[0] && names.includes(rest[0])) {
     return { ctx: tenantContext(rest[0], names.indexOf(rest[0])), rest: rest.slice(1) };
   }
-  if (names.length === 1) return { ctx: tenantContext(names[0]!, 0), rest };
-  console.error(`Несколько пользователей (${names.join(", ")}) — укажи имя первым аргументом.`);
+  console.error(`Укажи пользователя первым аргументом. Доступные: ${names.join(", ")}.`);
   process.exit(1);
 }
 
@@ -156,42 +153,19 @@ async function prepublish(): Promise<void> {
   console.log("\n✅ Готово к публикации: личные данные не утекают.\n");
 }
 
-async function permissionsCmd(rest: string[]): Promise<void> {
-  const [sub, arg] = rest;
-  if (sub === "list" || !sub) {
-    const perms = await listPermissions();
-    const ids = Object.keys(perms);
-    if (!ids.length) {
-      console.log('Явных разрешений нет. (Себе "me" и в управляющий канал — можно всегда.)');
-      return;
-    }
-    console.log("Кому агент может писать (allowlist):\n");
-    for (const id of ids) {
-      const p = perms[id]!;
-      console.log(`  ${id}  ${p.label ?? ""}  [${p.mode}] · ${p.source ?? ""} · ${p.createdAt}`);
-    }
-    return;
+// Запущен ли сервис хоть у одного тенанта (проверяем lock КАЖДОГО в его контексте).
+// install-service не должен зависеть от какого-то одного per-tenant lock.
+async function anyServiceRunning(): Promise<boolean> {
+  const names = await listTenants();
+  for (let i = 0; i < names.length; i++) {
+    const ctx = tenantContext(names[i]!, i);
+    if (await withTenant(ctx, () => serviceRunning())) return true;
   }
-  if (sub === "revoke") {
-    if (!arg) {
-      console.error("Укажите чат: bun run tg permissions revoke <id|@username>");
-      process.exit(1);
-    }
-    if (/^-?\d+$/.test(arg)) {
-      console.log((await revokePermission(Number(arg))) ? `Отозвано: ${arg}` : `Не найдено: ${arg}`);
-    } else {
-      // нужно разрешить @username → через сервис
-      const r = (await hubCall("permission_revoke", { chat: arg })) as { revoked: boolean };
-      console.log(r.revoked ? `Отозвано: ${arg}` : `Не найдено: ${arg}`);
-    }
-    return;
-  }
-  console.error(`Неизвестно: permissions ${sub}. Доступно: list, revoke <id|@username>`);
-  process.exit(1);
+  return false;
 }
 
 async function installServiceCmd(): Promise<void> {
-  const running = await serviceRunning();
+  const running = await anyServiceRunning();
   // Если экземпляр уже работает вручную — только включаем (не стартуем второй).
   const res = await installService(!running);
   console.log("");
@@ -255,9 +229,12 @@ async function tenantCmd(rest: string[]): Promise<void> {
       console.error("Укажи имя: bun run tg tenant migrate-legacy <имя>  (перенесёт текущую data/ в tenants/<имя>)");
       process.exit(1);
     }
-    const running = await serviceRunning();
-    if (running) {
-      console.error(`⚠️ Сервис запущен (pid ${running.pid}). Останови его перед миграцией, иначе можно потерять данные.`);
+    // Проверяем занятость по ВСЕМ тенантам (а не по текущему tenant-lock, которого тут
+    // ещё нет: миграция переносит ЯВНУЮ старую data/ в первого тенанта). Сервис мог бы
+    // держать другого тенанта — но саму data/ он уже не использует. Главное — не дать
+    // запущенному экземпляру потерять данные при rename.
+    if (await anyServiceRunning()) {
+      console.error("⚠️ Сервис запущен. Останови его перед миграцией, иначе можно потерять данные.");
       process.exit(1);
     }
     const dest = await migrateLegacy(name);
@@ -273,7 +250,7 @@ function help(): void {
     `tg — ИИ-агент для личного Telegram\n\n` +
       `Использование: bun run tg <команда>\n\n` +
       `  setup [имя]           мастер настройки тенанта (вход + бот + базовое) — начните с него\n` +
-      `  login [имя]           интерактивный вход в Telegram (для тенанта <имя>)\n` +
+      `  login <имя>           интерактивный вход в Telegram (для тенанта <имя>)\n` +
       `  tenant <list|add <имя>|migrate-legacy <имя>>  управление пользователями (тенантами)\n` +
       `  service [--once]       запустить агента-сервис (--once — один проход)\n` +
       `  install-service       поставить как фоновый сервис (systemd/launchd) + автозапуск\n` +
@@ -283,11 +260,10 @@ function help(): void {
       `  update                обновиться до последней версии (git pull + bun install)\n` +
       `  mcp                   запустить MCP-сервер вручную\n` +
       `  doctor [--prepublish] проверить окружение (или готовность к публикации)\n` +
-      `  permissions [имя] [list|revoke <chat>]  разрешения на отправку\n` +
-      `  qa [имя] "<текст>"    записать просьбу человека дословно (в папку пользователя)\n` +
-      `  status [имя]          показать handoff пользователя\n` +
+      `  qa <имя> "<текст>"    записать просьбу человека дословно (в папку пользователя)\n` +
+      `  status <имя>          показать handoff пользователя\n` +
       `  help                  эта справка\n` +
-      `\n[имя] — пользователь (tenant); можно опустить, если он один.\n`,
+      `\n<имя> — пользователь (tenant); указывай явно (авто-выбора единственного нет).\n`,
   );
 }
 
@@ -332,12 +308,6 @@ async function main(): Promise<void> {
       if (rest.includes("--prepublish")) await prepublish();
       else await doctor();
       break;
-    case "permissions":
-    case "perms": {
-      const { ctx, rest: r } = await cliTenant(rest);
-      await withTenant(ctx, () => permissionsCmd(r));
-      break;
-    }
     case "qa": {
       const { ctx, rest: r } = await cliTenant(rest);
       const text = r.join(" ").trim();

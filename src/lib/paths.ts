@@ -56,8 +56,22 @@ export function currentTenant(): TenantContext | undefined {
   return tenantStore.getStore();
 }
 
-/** Папка тенанта по имени (без активации контекста). */
+// Имя тенанта = имя папки в tenants/. Разрешены ТОЛЬКО буквы/цифры/_/- (без точки и
+// слэшей): иначе возможен path traversal («../data» ушёл бы из tenants/ и снова прочитал
+// legacy data/ — скрытый фолбэк, который запрещён). Это ЕДИНЫЙ источник правды; tenantDir
+// валидирует на месте, поэтому любой путь к папке тенанта безопасен по построению.
+export function isTenantName(name: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(name);
+}
+export function assertTenantName(name: string): void {
+  if (!isTenantName(name)) {
+    throw new Error(`Недопустимое имя тенанта "${name}". Разрешены только буквы, цифры, _ и - (без точек и слэшей).`);
+  }
+}
+
+/** Папка тенанта по имени (без активации контекста). Имя валидируется (anti-traversal). */
 export function tenantDir(name: string): string {
+  assertTenantName(name);
   return join(TENANTS_DIR, name);
 }
 
@@ -86,7 +100,8 @@ export const botChatPath = (): string => join(dataDir(), "bot-chat.md");
 export const statePath = (): string => join(dataDir(), "state.json");
 // Личная конфигурация (api_id/api_hash, выбор движка и пр.). Не коммитится.
 export const configPath = (): string => join(dataDir(), "config.json");
-// Code-level allowlist отправки сообщений (кому агент может писать). Не коммитится.
+// Легаси-файл разрешений старых тенантов. Кодом больше НЕ используется для решения «кому
+// писать» (отправка свободна), кроме блок-листа send_file (его нельзя слать наружу). Не коммитится.
 export const permissionsPath = (): string => join(dataDir(), "permissions.json");
 // Кто может писать сервисному боту (allowlist; по умолчанию только владелец).
 export const botUsersPath = (): string => join(dataDir(), "bot-users.json");

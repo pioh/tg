@@ -184,6 +184,33 @@ export async function installService(start = true): Promise<InstallResult> {
   return { ok: false, manager: os === "win32" ? "windows" : "manual", messages, docs: serviceDocs(os) };
 }
 
+/** Установлен ли НАШ фоновый сервис под менеджером (есть юнит systemd / plist launchd).
+ *  Нужно из мастера setup (он сам НЕ под менеджером, поэтому managedBy() там null), чтобы
+ *  понять, можно ли перезапустить сервис автоматически и подхватить нового тенанта. */
+export async function serviceIsManaged(): Promise<boolean> {
+  const os = currentOS();
+  const path = os === "linux" ? systemdUnitPath() : os === "darwin" ? launchdPlistPath() : null;
+  if (!path) return false;
+  return Bun.file(path).exists();
+}
+
+/** Перезапускает фоновый сервис через его менеджер (чтобы подхватил нового тенанта).
+ *  Возвращает ok=false, если ОС/менеджер не поддерживает авто-рестарт. */
+export async function restartService(): Promise<{ ok: boolean; message: string }> {
+  const os = currentOS();
+  if (os === "linux") {
+    const r = await run(["systemctl", "--user", "restart", `${SERVICE_NAME}.service`]);
+    if (r.code === 0) return { ok: true, message: "✅ Сервис перезапущен (systemd) — новый пользователь подхвачен." };
+    return { ok: false, message: `⚠️ Не удалось перезапустить: ${r.err || r.out}` };
+  }
+  if (os === "darwin") {
+    const r = await run(["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? ""}/${LAUNCHD_LABEL}`]);
+    if (r.code === 0) return { ok: true, message: "✅ Сервис перезапущен (launchd) — новый пользователь подхвачен." };
+    return { ok: false, message: `⚠️ Не удалось перезапустить: ${r.err || r.out}` };
+  }
+  return { ok: false, message: "Авто-перезапуск на этой ОС не поддерживается." };
+}
+
 export async function uninstallService(): Promise<{ ok: boolean; messages: string[] }> {
   const os = currentOS();
   const messages: string[] = [];

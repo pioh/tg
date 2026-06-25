@@ -3,10 +3,10 @@
 // mtcute-клиент. Так с Telegram работает только один процесс.
 
 import type { TelegramClient } from "@mtcute/bun";
-import { appendFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { appendFile, realpath } from "node:fs/promises";
+import { resolve, basename, sep } from "node:path";
 import { HUB_PORT } from "./lib/rpc.ts";
-import { actionsPath, configPath, lockPath, permissionsPath, sessionDir, statePath, tenantStore, type TenantContext } from "./lib/paths.ts";
+import { actionsPath, REPO_ROOT, TENANTS_DIR, tenantStore, type TenantContext } from "./lib/paths.ts";
 import { log } from "./lib/log.ts";
 import { loadConfig } from "./lib/config.ts";
 import { loadState, updateState, type AgentUsage } from "./lib/state.ts";
@@ -16,7 +16,6 @@ import * as monitors from "./lib/monitors.ts";
 import * as bot from "./lib/bot.ts";
 import * as botusers from "./lib/botusers.ts";
 import * as schedules from "./lib/schedules.ts";
-import * as permissions from "./lib/permissions.ts";
 import {
   appendProgress,
   assembleContextText,
@@ -34,11 +33,6 @@ import {
 function coercePeer(chatId: string): string | number {
   const s = String(chatId).trim();
   return /^-?\d+$/.test(s) ? Number(s) : s;
-}
-
-function isSelfChat(chat: string): boolean {
-  const s = String(chat).trim().toLowerCase();
-  return s === "me" || s === "self";
 }
 
 /** Убирает undefined-поля, чтобы Object.assign не затирал обязательные поля при патче
@@ -87,50 +81,44 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
   const meIdP = (): Promise<number> => (meIdCache ??= tg.getMe().then((m) => m.id));
   const peerId = async (chat: string): Promise<number> => (await tg.getPeer(coercePeer(chat))).id;
 
-  // Code-level gate: КОМУ агент имеет право писать. Разрешено: себе («Избранное»),
-  // в управляющий канал, в чаты с явным разрешением (permissions.json), и в чаты, на
-  // которые человек завёл включённый монитор action=reply. Иначе — запрет в КОДЕ
-  // (не только в промпте). См. rules/50-safety.md и lib/permissions.ts.
-  async function assertCanSend(chat: string): Promise<void> {
-    if (isSelfChat(chat)) return;
-    const meId = await meIdP();
-    const target = await peerId(chat);
-    if (target === meId) return;
-    const cfg = await loadConfig();
-    const control = cfg.controlChat ?? "me";
-    if (!isSelfChat(control)) {
-      try {
-        if ((await peerId(control)) === target) return;
-      } catch {
-        /* ignore */
-      }
-    }
-    if (await permissions.isAllowed(target)) return;
-    for (const m of await monitors.listMonitors()) {
-      if (!m.enabled || m.action !== "reply") continue;
-      try {
-        if ((await peerId(m.chat)) === target) return;
-      } catch {
-        /* ignore */
-      }
-    }
-    throw new Error(
-      `Отправка в чат ${target} запрещена кодом безопасности (rules/50). Нужно явное ` +
-        `разрешение: монитор action=reply на этот чат или permission_grant. Себе ("me") ` +
-        `и в управляющий канал писать можно всегда.`,
-    );
-  }
+  // ОТПРАВКА СВОБОДНА: писать можно в любой чат. Раньше тут был code-level gate
+  // (assertCanSend) — «кому можно писать». Его убрали (требование пользователя):
+  // защита только мешала (ломала создание бота через @BotFather в мастере setup), а
+  // бот всё равно мог снять её сам. Запрет утечки чувствительных ФАЙЛОВ — другое дело,
+  // он остаётся (assertSafeFile ниже). См. rules/50-safety.md.
 
-  // Нельзя отправлять чувствительные файлы (сессия, конфиг, .env, разрешения, lock).
-  function assertSafeFile(path: string): void {
-    const abs = resolve(path);
-    const blocked = [configPath(), statePath(), lockPath(), permissionsPath()];
-    const denied =
-      abs.startsWith(sessionDir()) ||
-      abs.endsWith(".session") ||
-      abs.endsWith(".env") ||
-      blocked.some((b) => abs === b);
-    if (denied) throw new Error(`Отправка этого файла запрещена (чувствительные данные): ${path}`);
+  // Нельзя отправлять чувствительные файлы. Проверка по РЕАЛЬНОМУ пути (realpath) и для
+  // ВСЕХ тенантов + legacy data/ (а не только текущего): иначе абсолютный путь к
+  // tenants/другой/config.json или чьей-то session/ ушёл бы наружу. Разрешены downloads/
+  // exports — их basename не секретный и они не в session/.
+  async function assertSafeFile(path: string): Promise<void> {
+    let abs: string;
+    try {
+      abs = await realpath(path);
+    } catch {
+      abs = resolve(path);
+    }
+    const base = basename(abs);
+    const deny = () => {
+      throw new Error(`Отправка этого файла запрещена (чувствительные данные): ${path}`);
+    };
+    // Запреты ПЕРВЫМИ и безусловно (секрет в downloads/ тоже не должен утечь). Несекретные
+    // медиа/экспорты не попадают ни под одно правило ниже и проходят свободно.
+    // .env и любые файлы сессии Telegram — никогда, где бы ни лежали.
+    if (base === ".env" || abs.endsWith(".session") || abs.includes(`${sep}session${sep}`)) deny();
+    // Секретные state-файлы — если лежат внутри ЛЮБОГО тенанта или legacy data/.
+    const SECRET_BASENAMES = new Set(["config.json", "state.json", "service.lock", "permissions.json", "bot-users.json"]);
+    if (SECRET_BASENAMES.has(base)) {
+      const roots: string[] = [];
+      for (const r of [TENANTS_DIR, resolve(REPO_ROOT, "data")]) {
+        try {
+          roots.push(await realpath(r));
+        } catch {
+          roots.push(r);
+        }
+      }
+      if (roots.some((r) => abs === r || abs.startsWith(r + sep))) deny();
+    }
   }
 
   return {
@@ -150,15 +138,13 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
     resolve: (a) => tgOps.resolve(tg, a.query),
     view_media: (a) => tgOps.getMedia(tg, a.chat, a.message_id),
     send_file: async (a) => {
-      await assertCanSend(a.chat);
-      assertSafeFile(a.path);
+      await assertSafeFile(a.path);
       return tgOps.sendFile(tg, a.chat, a.path, a.caption);
     },
     list_topics: (a) => tgOps.listTopics(tg, a.chat, a.limit ?? 50),
     get_topic_history: (a) => tgOps.getTopicHistory(tg, a.chat, a.topic_id, a.limit ?? 30),
 
     send_message: async (a) => {
-      await assertCanSend(a.chat);
       const res = await tgOps.sendMessage(tg, a.chat, a.text, a.reply_to);
       // не дать перечитать собственное сообщение в управляющем канале как команду
       try {
@@ -211,9 +197,8 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
     },
 
     // --- Мониторы ---
-    // Разрешение на отправку в чат монитора НЕ выдаётся отдельно: assertCanSend сам
-    // пускает отправку в чат ВКЛЮЧЁННОГО монитора action=reply. Поэтому «выключил
-    // монитор» = «отправка туда снова запрещена» автоматически, без висящих грантов.
+    // Отправка свободна (assertCanSend убран), поэтому никаких грантов вокруг мониторов
+    // больше нет: монитор лишь решает, КОГДА реагировать, а не «можно ли писать».
     monitor_add: async (a) =>
       monitors.addMonitor(tg, {
         name: a.name,
@@ -228,13 +213,9 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
         onlyIfOwnerSilentSec: a.only_if_owner_silent_sec,
       }),
     monitor_list: () => monitors.listMonitors(),
-    monitor_remove: async (a) => {
-      const removed = await monitors.removeMonitor(a.id);
-      if (removed) await permissions.revokeBySource(`monitor:${a.id}`); // снять легаси-грант
-      return { removed };
-    },
-    monitor_update: async (a) => {
-      const m = await monitors.updateMonitor(
+    monitor_remove: async (a) => ({ removed: await monitors.removeMonitor(a.id) }),
+    monitor_update: async (a) =>
+      monitors.updateMonitor(
         a.id,
         omitUndefined({
           enabled: a.enabled,
@@ -242,20 +223,8 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
           minIntervalSec: a.min_interval_sec,
           onlyIfOwnerSilentSec: a.only_if_owner_silent_sec,
         }),
-      );
-      // Если монитор больше не «включённый reply» — снять легаси-грант, выданный им.
-      if (m && (!m.enabled || m.action !== "reply")) await permissions.revokeBySource(`monitor:${m.id}`);
-      return m;
-    },
+      ),
     monitor_poll: async () => monitors.evaluateMonitors(tg, Date.now()),
-
-    // --- Разрешения на отправку (code-level allowlist) ---
-    permission_list: () => permissions.listPermissions(),
-    permission_grant: async (a) => {
-      const id = await peerId(a.chat);
-      return permissions.grantPermission(id, { label: a.label, source: a.source ?? "manual" });
-    },
-    permission_revoke: async (a) => ({ revoked: await permissions.revokePermission(await peerId(a.chat)) }),
 
     // --- Реакции (👀 = «увидел», НЕ отметка прочитанным) ---
     react: (a) => tgOps.react(tg, a.chat, a.message_id, a.emoji ?? "👀"),
@@ -263,7 +232,25 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
 
     // --- Бот (getUpdates сериализуется) ---
     bot_status: () => bot.botStatus(),
-    bot_set_token: (a) => bot.setBotToken(a.token),
+    bot_set_token: async (a) => {
+      const res = await bot.setBotToken(a.token);
+      // B3 (детерминированно в КОДЕ, не в тексте миссии): сразу регистрируем владельца у
+      // бота — шлём ему "/start" от user-аккаунта и опрашиваем, пока бот не свяжет chat
+      // владельца (ownerChatKnown). Не требуем ручного «нажми Start». Best-effort.
+      try {
+        await tgOps.sendMessage(tg, "@" + res.username, "/start");
+        const meId = await meIdP();
+        for (let i = 0; i < 15; i++) {
+          await botSerial(() => bot.botPoll(meId, 0));
+          const st = await bot.botStatus();
+          if (st.configured && st.ownerChatKnown) break;
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      } catch {
+        /* не критично: если не вышло — владелец просто напишет боту сам */
+      }
+      return res;
+    },
     bot_poll: async (a) => botSerial(async () => bot.botPoll(await meIdP(), a.timeout ?? 0)),
     bot_send: (a) => bot.botSend(a.text, a.chat_id),
     bot_progress: (a) => bot.botProgress(a.text, a.chat_id),

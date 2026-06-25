@@ -7,9 +7,12 @@
 
 1. Прочитай `rules/00-agent-core.md` — кто ты и доктрина «память на диске».
 2. Прочитай `rules/10-memory-hierarchy.md` — структура памяти и как её вести.
-3. Загрузи актуальную память: вызови MCP-инструмент `mem_bootstrap` (он соберёт
+3. **Выбери пользователя (тенанта)**: вызови MCP-инструмент `list_tenants`, затем
+   `set_context(<имя>)`. Без этого остальные MCP-инструменты (включая `mem_bootstrap`)
+   вернут ошибку — это сделано намеренно (никаких скрытых дефолтов/авто-выбора).
+4. Загрузи актуальную память: вызови MCP-инструмент `mem_bootstrap` (он соберёт
    правила + `data/handoff.md` + свежие `data/qa` + хвост `data/progress.txt`).
-4. Остальные правила: `rules/20-telegram-tools.md`, `rules/30-chat-handling.md`,
+5. Остальные правила: `rules/20-telegram-tools.md`, `rules/30-chat-handling.md`,
    `rules/40-reply-style.md`, `rules/50-safety.md`.
 
 ## Где что менять (важно)

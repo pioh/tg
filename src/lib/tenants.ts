@@ -5,8 +5,12 @@
 
 import { mkdir, readdir, rename, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { REPO_ROOT, TENANTS_DIR, tenantDir, tenantStore, type TenantContext } from "./paths.ts";
+import { REPO_ROOT, TENANTS_DIR, tenantDir, tenantStore, isTenantName, assertTenantName, type TenantContext } from "./paths.ts";
 import { ensureDataLayout } from "./memory.ts";
+
+// Единый источник валидации имени тенанта — в paths.ts (там же tenantDir его применяет).
+// Ре-экспортируем для удобных импортов из этого модуля.
+export { isTenantName, assertTenantName };
 
 // Базовый порт RPC-хаба; тенантам выдаются base, base+1, … (фактический порт пишется
 // в lock каждого тенанта — MCP-прокси читает его оттуда).
@@ -14,8 +18,16 @@ export const HUB_BASE_PORT: number = Number(process.env.TG_HUB_PORT ?? 8765);
 
 // Старая единая папка data/ — ТОЛЬКО как источник для одноразовой миграции в tenants/.
 // В рантайме никакого legacy-режима нет (всё работает на тенантах).
-function legacyDataDir(): string {
-  return process.env.TG_DATA_DIR ? resolve(process.env.TG_DATA_DIR) : resolve(REPO_ROOT, "data");
+//
+// ВАЖНО: источник миграции — ЯВНЫЙ REPO_ROOT/data, и НИКОГДА не берётся из TG_DATA_DIR.
+// TG_DATA_DIR указывает на рабочую папку ТЕКУЩЕГО тенанта (paths.dataDir), и если бы
+// миграция читала источник оттуда, то при выставленном TG_DATA_DIR (а его ставит live-MCP
+// и мастер setup) она бы перенесла НЕ старую data/, а папку самого тенанта — скрытый
+// env-фолбэк и потенциальная потеря данных. Поэтому здесь TG_DATA_DIR игнорируется.
+// Тестовый override источника — отдельный явный TG_LEGACY_DATA_DIR (чтобы тесты не трогали
+// реальную REPO_ROOT/data); он НЕ участвует в выборе тенанта.
+export function legacyDataDir(): string {
+  return process.env.TG_LEGACY_DATA_DIR ? resolve(process.env.TG_LEGACY_DATA_DIR) : resolve(REPO_ROOT, "data");
 }
 
 async function isDir(p: string): Promise<boolean> {
@@ -26,31 +38,31 @@ async function isDir(p: string): Promise<boolean> {
   }
 }
 
-function validateName(name: string): void {
-  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
-    throw new Error(`Недопустимое имя тенанта "${name}". Разрешены буквы, цифры, . _ -`);
-  }
-}
-
-/** Имена всех тенантов (папки в TENANTS_DIR), по алфавиту. */
+/** Имена всех тенантов (валидные папки в TENANTS_DIR), по алфавиту. Папки с кривым/
+ *  traversal-именем игнорируются (а не роняют старт сервиса через tenantContext). */
 export async function listTenants(): Promise<string[]> {
   try {
     const entries = await readdir(TENANTS_DIR, { withFileTypes: true });
-    return entries
-      .filter((e) => e.isDirectory() && !e.name.startsWith("."))
-      .map((e) => e.name)
-      .sort();
+    const names: string[] = [];
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith(".")) continue;
+      if (!isTenantName(e.name)) continue; // пропускаем невалидные имена папок
+      names.push(e.name);
+    }
+    return names.sort();
   } catch {
     return [];
   }
 }
 
 export async function tenantExists(name: string): Promise<boolean> {
+  if (!isTenantName(name)) return false; // кривое имя (traversal) = «не существует»
   return isDir(tenantDir(name));
 }
 
 /** Контекст тенанта (имя + папка + порт хаба). index определяет порт base+index. */
 export function tenantContext(name: string, index: number): TenantContext {
+  assertTenantName(name);
   return { name, dataDir: tenantDir(name), hubPort: HUB_BASE_PORT + index };
 }
 
@@ -61,7 +73,7 @@ export function withTenant<T>(ctx: TenantContext, fn: () => T): T {
 
 /** Создаёт папку тенанта и засевает структуру (data layout). */
 export async function createTenant(name: string): Promise<string> {
-  validateName(name);
+  assertTenantName(name);
   const dir = tenantDir(name);
   if (await isDir(dir)) throw new Error(`Тенант "${name}" уже существует: ${dir}`);
   await mkdir(dir, { recursive: true });
@@ -71,7 +83,7 @@ export async function createTenant(name: string): Promise<string> {
 
 /** Переносит legacy-папку data/ в tenants/<name> (единообразный формат). */
 export async function migrateLegacy(name: string): Promise<string> {
-  validateName(name);
+  assertTenantName(name);
   const src = legacyDataDir();
   const dest = tenantDir(name);
   if (!(await isDir(src))) throw new Error(`Папка ${src} не найдена — мигрировать нечего.`);

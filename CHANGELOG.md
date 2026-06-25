@@ -11,6 +11,43 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-25
+
+Плавный UX мультитенанта по `spec/it6.txt`. Сделано воркфлоу-агентами + перекрёстное ревью
++ 5 проходов независимой проверки Codex (финал — без P0/P1/P2).
+
+### Changed
+- **BREAKING**: интерактивный MCP теперь требует ЯВНОГО выбора пользователя — инструмент
+  `set_context(<имя>)` (раз за сессию) + `list_tenants`. Никаких env для выбора тенанта и
+  никакого авто-выбора единственного — скрытые дефолты убраны (главное требование).
+- **Убрана защита отправки** (`assertCanSend`) и весь модуль разрешений: отправка в любой
+  чат свободна, дисциплина «пиши посторонним только по просьбе/правилу» — в `rules/50`.
+  Побочно починилось создание бота через @BotFather (раньше его блокировал гейт).
+- Имя тенанта строго валидируется в `tenantDir` (`[A-Za-z0-9_-]`, без `..`/слэшей) —
+  закрыт path-traversal и скрытый фолбэк на legacy `data/`.
+
+### Added
+- Надёжный авто-формат сообщений бота: **Markdown → Telegram HTML** (parse_mode HTML).
+  Больше не уходят сырыми из-за спецсимволов MarkdownV2 (`_`, `.`, `(`, `@` и т.п.).
+- Авто-регистрация владельца у бота в КОДЕ: после `bot_set_token` сервис сам шлёт `/start`
+  от аккаунта владельца и ждёт привязку — без ручного «нажми Start».
+
+### Fixed
+- `setBotToken` при смене токена (в т.ч. через `TG_BOT_TOKEN`) сбрасывает старые
+  `botOwnerChatId`/`botGroupChatId`/offset (иначе `bot_status` врал, а `/start` терялся).
+- `assertSafeFile` — по `realpath`, блокирует секреты (session/config/state/lock/
+  permissions/.env) у ВСЕХ тенантов и legacy, включая подкинутые в `downloads/`.
+- `listTenants` игнорирует папки с кривым именем (не роняют старт сервиса).
+- lock пишется ПОСЛЕ бинда хаба; `hubCall` ретраит на ECONNREFUSED/401 (перечитав lock);
+  `setup` убивает временный child по таймауту; CLI работает в явном контексте тенанта.
+- `doctor` пер-тенантный и сам авто-мигрирует legacy `data/`.
+
+### Removed
+- Разрешения на отправку: MCP `permission_*`, бот-команды `/grant` `/revoke` `/permissions`,
+  CLI `tg permissions`; модуль `src/lib/permissions.ts`.
+- Авто-выбор единственного тенанта (везде — только явный выбор).
+- MarkdownV2 как формат доставки (заменён на Telegram HTML).
+
 ## [0.6.0] - 2026-06-24
 
 ### Changed
@@ -123,7 +160,8 @@
   Claude Code / Codex, дисковая память (handoff/progress/qa/rules), мониторы,
   расписания, сервисный бот, RPC-хаб с bearer-токеном, lock единственного сервиса.
 
-[Unreleased]: https://github.com/pioh/tg/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/pioh/tg/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/pioh/tg/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pioh/tg/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/pioh/tg/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/pioh/tg/compare/v0.4.0...v0.5.0

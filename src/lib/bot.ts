@@ -6,7 +6,7 @@
 // через user-аккаунт (tg_send_message/tg_get_history к @BotFather), получает токен и
 // сохраняет его (bot_set_token). Дальше бот работает через HTTPS Bot API.
 
-import { loadConfig, saveConfig } from "./config.ts";
+import { loadConfig, loadFileConfig, saveConfig } from "./config.ts";
 import { loadState, updateState } from "./state.ts";
 import { recordQa } from "./memory.ts";
 import { isBotUserAllowed } from "./botusers.ts";
@@ -57,6 +57,185 @@ export function splitMessage(text: string, limit = TG_LIMIT): string[] {
   return n <= 1 ? chunks : chunks.map((c, i) => `📄 ${i + 1}/${n}\n${c}`);
 }
 
+// ---------------------------------------------------------------------------
+// Авто-формат сообщений: обычный Markdown агента → Telegram HTML (parse_mode HTML).
+//
+// Зачем HTML, а не MarkdownV2: MarkdownV2 требует экранировать ОГРОМНЫЙ набор
+// спецсимволов (_*[]()~`>#+-=|{}.!) ВЕЗДЕ вне намеренной разметки — один незакрытый
+// `_` (напр. в @n_e0h) рушит парсинг, и сообщение уходит сырым. HTML сильно прощающее:
+// экранируем всего три символа (< > &), а разметку расставляем сами тегами, поэтому
+// случайные символы Markdown-вселенной (точки, скобки, подчёркивания) безопасны.
+//
+// Поддерживаем то, что реально пишет агент: **жирный**/__жирный__, *курсив*/_курсив_,
+// ~~зачёркнутый~~, `код` и ```код-блоки```, [текст](url), заголовки (# …) → жирная
+// строка. Всё остальное (списки, переводы строк) — как есть. Чистая функция без сети.
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// --- Эмфазис (*курсив*/**жирный**/***оба***, то же с _) через делимитер-стек ---
+//
+// Зачем не регэкспы: парные замены «жирный, потом курсив» дают КРЕСТЯЩИЕСЯ теги
+// (***x*** → <b><i>x</b></i>) — Telegram такой HTML отвергает, и сообщение уходит
+// сырым. А наивный курсив ломает идентификаторы/умножение: process_user_data →
+// process<i>user</i>data, 5*5 → 5<i>5…</i>. Поэтому разбираем по правилам флэнкинга
+// CommonMark и собираем ВСЕГДА правильно вложенные теги.
+//
+// Флэнкинг (упрощённо, как в CommonMark): делимитер-ран может ОТКРЫВАТЬ (left-flanking),
+// если справа не пробел и это не «пунктуация справа при слове слева»; ЗАКРЫВАТЬ
+// (right-flanking) — зеркально. Доп. правило: внутри слова (алфанумерик с обеих сторон)
+// ни '*', ни '_' не эмфазис — это спасает snake_case и умножение «5*5». Для '_'
+// CommonMark строже: он не открывает/закрывает, если примыкает к слову (этого достаточно
+// для имён файлов/переменных вида my_app_server.log).
+
+const isWordChar = (ch: string): boolean => ch !== "" && /[\p{L}\p{N}]/u.test(ch);
+const isPunctChar = (ch: string): boolean => ch !== "" && !isWordChar(ch) && !/\s/.test(ch);
+
+interface Delim {
+  ch: "*" | "_";
+  count: number; // сколько делимитеров ещё доступно для открытия
+  outIndex: number; // позиция «ячейки» в out, куда вставлять открывающие теги/остаток
+}
+
+// Преобразует строку (уже html-экранированную, без код/ссылок) в HTML с <b>/<i>.
+// Один проход слева направо: открывающие делимитеры кладём на стек, на закрывающем
+// ищем ближайший совместимый открыватель и расставляем правильно вложенные теги.
+function applyEmphasis(s: string): string {
+  const out: string[] = [];
+  const stack: Delim[] = [];
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i]!;
+    if (ch !== "*" && ch !== "_") {
+      out.push(ch);
+      i++;
+      continue;
+    }
+    // Ран одинаковых делимитеров.
+    let j = i;
+    while (j < s.length && s[j] === ch) j++;
+    const count = j - i;
+    const before = i > 0 ? s[i - 1]! : "";
+    const after = j < s.length ? s[j]! : "";
+    const wBefore = isWordChar(before);
+    const wAfter = isWordChar(after);
+    // left-flanking: справа не пробел и не «пунктуация справа при слове слева».
+    const leftFlank = after !== "" && !/\s/.test(after) && !(isPunctChar(after) && wBefore && !isPunctChar(before));
+    // right-flanking: слева не пробел и не «пунктуация слева при слове справа».
+    const rightFlank = before !== "" && !/\s/.test(before) && !(isPunctChar(before) && wAfter && !isPunctChar(after));
+    const intraword = wBefore && wAfter; // snake_case / умножение → буквальный текст
+    let canOpen = leftFlank && !intraword;
+    let canClose = rightFlank && !intraword;
+    if (ch === "_") {
+      // '_' не открывает/закрывает, примыкая к слову (имена файлов/переменных).
+      if (wBefore) canOpen = false;
+      if (wAfter) canClose = false;
+    }
+    if (!canOpen && !canClose) {
+      out.push(ch.repeat(count));
+      i = j;
+      continue;
+    }
+    let outIndex = out.length;
+    out.push(ch.repeat(count)); // по умолчанию — буквальный текст; при совпадении заменим
+    let remaining = count;
+    if (canClose) {
+      // Ближайший открыватель того же символа.
+      let k = stack.length - 1;
+      while (k >= 0 && stack[k]!.ch !== ch) k--;
+      if (k >= 0) {
+        const opener = stack[k]!;
+        const used = Math.min(opener.count, remaining);
+        const openTag = used >= 3 ? "<b><i>" : used === 2 ? "<b>" : "<i>";
+        const closeTag = used >= 3 ? "</i></b>" : used === 2 ? "</b>" : "</i>";
+        const openLeft = opener.count - used;
+        const closeLeft = remaining - used;
+        out[opener.outIndex] = (openLeft > 0 ? ch.repeat(openLeft) : "") + openTag;
+        out[outIndex] = closeTag;
+        // Всё, что было открыто внутри (между opener и текущим), парой не стало —
+        // остаётся буквальным текстом; снимаем эти записи и сам opener.
+        stack.length = k;
+        remaining = closeLeft;
+        // Лишние делимитеры закрывающего рана — в ОТДЕЛЬНУЮ ячейку, чтобы возможное
+        // последующее открытие ими не затёрло уже расставленный closeTag.
+        if (remaining > 0) {
+          outIndex = out.length;
+          out.push(ch.repeat(remaining));
+        }
+      }
+    }
+    // Остаток рана может открывать (напр. «**a *b*» — после закрытия остаётся открыватель).
+    if (canOpen && remaining > 0) {
+      stack.push({ ch, count: remaining, outIndex });
+    }
+    i = j;
+  }
+  return out.join("");
+}
+
+// Применяет инлайновую разметку к УЖЕ html-экранированному тексту строки (без код-блоков).
+// Инлайн-код и ссылки сначала «вынимаются» плейсхолдерами (их содержимое не должно
+// интерпретироваться как жирный/курсив), затем расставляется *жирный*/_курсив_/~~зач~~,
+// и в конце плейсхолдеры возвращаются. Плейсхолдер берём из приватной зоны Unicode
+// (…) — в нормальном тексте таких символов нет.
+function applyInline(escaped: string): string {
+  const stash: string[] = [];
+  const keep = (html: string): string => {
+    stash.push(html);
+    return `${stash.length - 1}`;
+  };
+
+  let s = escaped;
+  // Инлайновый код `...` — содержимое уже экранировано (escapeHtml выше), оборачиваем в <code>.
+  s = s.replace(/`([^`\n]+)`/g, (_m, code: string) => keep(`<code>${code}</code>`));
+  // Ссылки [текст](url): экранируем url для атрибута (кавычки тоже).
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (_m, text: string, url: string) => {
+    const href = url.replace(/"/g, "&quot;");
+    return keep(`<a href="${href}">${text}</a>`);
+  });
+  // Зачёркнутый: ~~...~~
+  s = s.replace(/~~([^\n]+?)~~/g, (_m, t: string) => `<s>${t}</s>`);
+  // Жирный/курсив/жирный-курсив (* и _) — единый разбор со стеком: теги всегда вложены
+  // правильно (***x*** → <b><i>x</i></b>, не крестящиеся), а одиночные '*'/'_' внутри
+  // слов и умножение (5*5, process_user_data) остаются буквальными.
+  s = applyEmphasis(s);
+
+  // Возвращаем вынутые код/ссылки на место.
+  s = s.replace(/(\d+)/g, (_m, i: string) => stash[Number(i)]!);
+  return s;
+}
+
+/**
+ * Конвертирует обычный Markdown (как его пишет агент) в Telegram-safe HTML.
+ * Код-блоки ```…``` обрабатываются отдельно (внутри — без инлайновой разметки),
+ * всё прочее — построчно с инлайн-разметкой. Возвращает строку для parse_mode:"HTML".
+ */
+export function mdToTelegramHtml(md: string): string {
+  const out: string[] = [];
+  // Делим на сегменты по ограждённым код-блокам ```...```; нечётные — это блоки кода.
+  const segments = md.split(/```/);
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    if (i % 2 === 1) {
+      // Код-блок: первая строка может быть языком (его отбрасываем как разметку Markdown).
+      const nl = seg.indexOf("\n");
+      const body = nl >= 0 && !/\s/.test(seg.slice(0, nl)) ? seg.slice(nl + 1) : seg;
+      out.push(`<pre>${escapeHtml(body)}</pre>`);
+      continue;
+    }
+    // Обычный текст: построчно — заголовки в жирный, остальное — инлайн-разметка.
+    const lines = seg.split("\n").map((line) => {
+      const esc = escapeHtml(line);
+      const h = esc.match(/^\s{0,3}#{1,6}\s+(.*)$/);
+      if (h) return `<b>${applyInline(h[1]!)}</b>`;
+      return applyInline(esc);
+    });
+    out.push(lines.join("\n"));
+  }
+  return out.join("");
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function api<T = any>(token: string, method: string, params?: Record<string, unknown>): Promise<T> {
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -90,7 +269,22 @@ export async function botStatus() {
  *  меню команд и описание бота, чтобы в Telegram сразу были подсказки. */
 export async function setBotToken(token: string) {
   const me = await api(token, "getMe");
-  await saveConfig({ botToken: token, botUsername: me.username });
+  // Сравниваем с токеном из ФАЙЛА (не effective: TG_BOT_TOKEN мог бы перекрыть и скрыть смену).
+  const prev = await loadFileConfig();
+  const tokenChanged = prev.botToken !== token;
+  // При СМЕНЕ токена это ДРУГОЙ бот: старые привязки владельца/группы и offset getUpdates
+  // не валидны. Иначе bot_status соврёт ownerChatKnown=true, а botPoll пропустит новый
+  // /start (offset от прежнего бота). Сбрасываем — авто-/start зарегистрирует владельца заново.
+  await saveConfig(
+    tokenChanged
+      ? { botToken: token, botUsername: me.username, botOwnerChatId: undefined, botGroupChatId: undefined }
+      : { botToken: token, botUsername: me.username },
+  );
+  if (tokenChanged) {
+    await updateState((s) => {
+      s.botUpdateOffset = undefined;
+    });
+  }
   await registerBotCommands(token).catch(() => {});
   return { ok: true, username: me.username as string, link: `https://t.me/${me.username}` };
 }
@@ -107,9 +301,6 @@ const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: "effort", description: "уровень усилия: /effort <low|…>" },
   { command: "monitors", description: "активные мониторы" },
   { command: "schedules", description: "расписания" },
-  { command: "permissions", description: "кому агент может писать" },
-  { command: "grant", description: "разрешить агенту писать в чат: /grant <chat>" },
-  { command: "revoke", description: "отозвать разрешение: /revoke <chat>" },
   { command: "users", description: "кто может писать боту" },
   { command: "allowuser", description: "разрешить писать боту: /allowuser <id|@user>" },
   { command: "denyuser", description: "запретить писать боту: /denyuser <id|@user>" },
@@ -230,19 +421,20 @@ export async function botPoll(
   return { configured: true, newMessages: out, unauthorized };
 }
 
-// Отправляет один кусок: сначала как Telegram MarkdownV2; если разметка невалидна
-// (Telegram вернёт ошибку парсинга) — повторяет обычным текстом, чтобы сообщение НЕ
-// потерялось. Так агент может форматировать MarkdownV2, а наши ошибки не фатальны.
+// Отправляет один кусок: конвертирует Markdown агента в Telegram-safe HTML и шлёт с
+// parse_mode "HTML" (HTML прощающее — экранируем только < > &, разметку ставим тегами,
+// поэтому случайные `_`/`.`/скобки не ломают парсинг). Фолбэк на обычный текст — ТОЛЬКО
+// как последняя страховка (если Telegram всё же отверг HTML), чтобы сообщение не пропало.
 async function sendOnePart(token: string, chat: number, text: string): Promise<{ message_id: number }> {
   try {
-    return await api(token, "sendMessage", { chat_id: chat, text, parse_mode: "MarkdownV2" });
+    return await api(token, "sendMessage", { chat_id: chat, text: mdToTelegramHtml(text), parse_mode: "HTML" });
   } catch {
     return await api(token, "sendMessage", { chat_id: chat, text });
   }
 }
 
-/** Бот пишет человеку (по умолчанию — владельцу в его чат с ботом). Текст
- *  форматируется как MarkdownV2 (с фолбэком на обычный текст), длинное — режется. */
+/** Бот пишет человеку (по умолчанию — владельцу в его чат с ботом). Обычный Markdown
+ *  агента конвертируется в Telegram HTML (с фолбэком на обычный текст), длинное — режется. */
 export async function botSend(text: string, chatId?: number) {
   const cfg = await loadConfig();
   if (!cfg.botToken) throw new Error("Бот не настроен. Сначала создайте бота и сохраните токен (bot_set_token).");

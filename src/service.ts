@@ -8,7 +8,7 @@
 // непрерывная сессия агента (streaming, переживает рестарт и падения через watchdog),
 // индикатор «печатает…», авто-доставка текста агента в Telegram, периодическая проверка
 // обновлений. Команды бота: /help /start /new /compact /context /model /effort /monitors
-// /schedules /permissions /grant /revoke /users /allowuser /denyuser /version /update /restart.
+// /schedules /users /allowuser /denyuser /here /version /update /restart.
 //
 // Флаг --once: один проход по каждому тенанту и выход (для проверки/cron).
 
@@ -19,7 +19,7 @@ import { managedBy } from "./lib/service-install.ts";
 import { createClient, hasSession } from "./telegram/client.ts";
 import { ensureDataLayout, appendProgress } from "./lib/memory.ts";
 import { loadState, updateState, type AgentUsage } from "./lib/state.ts";
-import { acquireLock, releaseLock } from "./lib/lock.ts";
+import { prepareLock, writeLock, releaseLock } from "./lib/lock.ts";
 import { buildHandlers, startHubServer, type Handlers, type AgentSessionCtx } from "./hub.ts";
 import { buildSystemAppend } from "./agent/prompt.ts";
 import { createAgentSession, type AgentSession, type TurnUsage } from "./agent/session.ts";
@@ -35,21 +35,22 @@ const LIVE_INTRO = `Ты — живая сессия агента личного
 
 ‼️ КАК ТЫ ОБЩАЕШЬСЯ С ЧЕЛОВЕКОМ В TELEGRAM:
 Весь твой ТЕКСТОВЫЙ вывод автоматически отправляется человеку как сообщение бота в
-Telegram (формат Telegram MarkdownV2). Поэтому НЕ нужно звать bot_send, чтобы ответить —
-просто напиши ответ текстом, и он уйдёт человеку. Пиши по-человечески и на ЯЗЫКЕ
-человека (обычно по-русски) только то, что адресовано ему — без служебных мета-
-заметок («owner checks…», «msgId 54»). Внутренние рассуждения держи в thinking, не в
-тексте. Форматируй MarkdownV2 (*жирный*, _курсив_, \`код\`); спецсимволы _*[]()~\`>#+-=|{}.!
-экранируй обратным слешем (если ошибёшься — отправится обычным текстом). bot_send нужен
-ТОЛЬКО чтобы написать в КОНКРЕТНЫЙ chat_id (не тому, кто сейчас пишет) или проактивно по
-расписанию; для обычного ответа bot_send НЕ вызывай (будет дубль). Пока ты работаешь,
-человеку сам показывается индикатор «печатает…».
+Telegram. Поэтому НЕ нужно звать bot_send, чтобы ответить — просто напиши ответ текстом,
+и он уйдёт человеку. Пиши по-человечески и на ЯЗЫКЕ человека (обычно по-русски) только
+то, что адресовано ему — без служебных мета-заметок («owner checks…», «msgId 54»).
+Внутренние рассуждения держи в thinking, не в тексте. Форматируй ОБЫЧНЫМ Markdown
+(**жирный**, *курсив*, \`код\`, \`\`\`блоки кода\`\`\`, [текст](url)) — сервис сам конвертирует
+его в Telegram-разметку и экранирует спецсимволы; НИЧЕГО экранировать вручную НЕ нужно.
+bot_send нужен ТОЛЬКО чтобы написать в КОНКРЕТНЫЙ chat_id (не тому, кто сейчас пишет) или
+проактивно по расписанию; для обычного ответа bot_send НЕ вызывай (будет дубль). Пока ты
+работаешь, человеку сам показывается индикатор «печатает…».
 
 Мониторы — по их action (на монитор один ответ на пачку, если правило не велит иначе).
 👀-реакцию ставит только БОТ в своей личке (что принял твоё сообщение) — сервис делает
 это сам; на сообщения других людей реакции НЕ ставь. НЕ отмечай прочитанным. По
-умолчанию пассивен. Отправка в чужие чаты разрешена кодом только при явном разрешении
-(монитор reply / permission_grant). Значимое — в handoff/progress. Следи за контекстом
+умолчанию пассивен: отправка технически свободна (писать можно в любой чат), но в
+чужие чаты пиши ТОЛЬКО по явной просьбе человека или по его правилу (монитор reply).
+Значимое — в handoff/progress. Следи за контекстом
 (session_status); если переполняется — актуализируй handoff/память и session_reset.\n`;
 
 function freshUsage(): AgentUsage {
@@ -108,9 +109,6 @@ function helpText(isOwner: boolean): string {
     `/effort <low|medium|high|xhigh|max> — уровень усилия\n` +
     `/monitors — активные мониторы\n` +
     `/schedules — расписания\n` +
-    `/permissions — кому я могу писать\n` +
-    `/grant <chat> — разрешить мне писать в чат (id или @username)\n` +
-    `/revoke <chat> — отозвать разрешение\n` +
     `/users — кто может писать боту\n` +
     `/allowuser <id|@user> — разрешить писать боту\n` +
     `/denyuser <id|@user> — запретить писать боту\n` +
@@ -133,11 +131,6 @@ function fmtMonitors(list: any[]): string {
 function fmtSchedules(list: any[]): string {
   if (!list?.length) return "Расписаний нет. Попроси: «каждые N минут …».";
   return "⏰ Расписания:\n" + list.map((s) => `${s.enabled ? "🟢" : "⚪️"} ${s.id} ${s.name} · каждые ${s.everySec}с → ${s.deliver}`).join("\n");
-}
-function fmtPermissions(perms: Record<string, any>): string {
-  const ids = Object.keys(perms ?? {});
-  if (!ids.length) return 'Явных разрешений нет. Себе («me») и в управляющий канал — пишу всегда.';
-  return "✅ Могу писать:\n" + ids.map((id) => `${id} ${perms[id].label ?? ""} · ${perms[id].source ?? ""}`).join("\n");
 }
 function fmtBotUsers(list: any[]): string {
   if (!list?.length) return "Боту может писать только владелец. Добавить: /allowuser <id|@user>.";
@@ -220,7 +213,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     },
   };
 
-  // Текст агента → человеку (как сообщение бота, MarkdownV2, длинное режется). Серия.
+  // Текст агента → человеку (как сообщение бота; Markdown→HTML и нарезку делает botSend). Серия.
   // Цель — голова FIFO (чат текущего хода); для событий без адресата (мониторы) — owner.
   function forwardAgentText(text: string): void {
     const t = text.trim();
@@ -493,8 +486,6 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
         await reply(fmtMonitors((await h.monitor_list!({}).catch(() => [])) as any[]));
       } else if (cmd === "/schedules") {
         await reply(fmtSchedules((await h.schedule_list!({}).catch(() => [])) as any[]));
-      } else if (cmd === "/permissions") {
-        await reply(fmtPermissions((await h.permission_list!({}).catch(() => ({}))) as Record<string, any>));
       } else if (cmd === "/users") {
         await reply(fmtBotUsers((await h.bot_users_list!({}).catch(() => [])) as any[]));
       } else if (cmd === "/allowuser") {
@@ -518,26 +509,9 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
             await reply(`Не вышло: ${e instanceof Error ? e.message : String(e)}`);
           }
         }
-      } else if (cmd === "/grant") {
-        if (!arg) await reply("Использование: /grant <id|@username> — разрешить мне писать в этот чат.");
-        else {
-          try {
-            await h.permission_grant!({ chat: arg, source: "bot:/grant" });
-            await reply(`✅ Разрешил себе писать в чат ${arg}.`);
-          } catch (e) {
-            await reply(`Не вышло: ${e instanceof Error ? e.message : String(e)}`);
-          }
-        }
-      } else if (cmd === "/revoke") {
-        if (!arg) await reply("Использование: /revoke <id|@username>");
-        else {
-          try {
-            const r = (await h.permission_revoke!({ chat: arg })) as { revoked: boolean };
-            await reply(r.revoked ? `🚫 Отозвал разрешение писать в ${arg}.` : `Разрешения на ${arg} не было.`);
-          } catch (e) {
-            await reply(`Не вышло: ${e instanceof Error ? e.message : String(e)}`);
-          }
-        }
+      } else if (cmd === "/grant" || cmd === "/revoke" || cmd === "/permissions") {
+        // Раздача разрешений на отправку убрана: писать можно в любой чат свободно.
+        await reply("Разрешения на отправку больше не нужны — я могу писать в любой чат. По умолчанию пишу только по твоей просьбе/правилу.");
       } else if (isCmd) {
         await reply("Неизвестная команда. /help — список команд.");
       } else {
@@ -575,9 +549,12 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       throw new Error(`сессия Telegram недействительна (${e instanceof Error ? e.message : e}); войдите заново: bun run tg login ${ctx.name}`);
     }
 
-    // 2) Авторизация ок — берём свободный порт, занимаем lock и поднимаем хаб.
+    // 2) Авторизация ок — берём свободный порт и ПОДГОТАВЛИВАЕМ координаты (без записи
+    // lock). Сначала реально поднимаем хаб (он должен слушать порт), и только ПОСЛЕ
+    // успешного бинда атомарно пишем lock. Иначе окно: lock уже на диске (порт/токен),
+    // а хаб ещё не слушает — потребитель схватил бы мёртвый порт/токен.
     hubPort = pickPort(ctx.hubPort);
-    const lock = await acquireLock(hubPort);
+    const lock = await prepareLock(hubPort);
     hubToken = lock.token;
     const st0 = await loadState();
     agentSessionId = st0.agentSessionId;
@@ -585,6 +562,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     agentUsage = st0.agentUsage ?? freshUsage();
     handlers = buildHandlers(tg, sessionCtx);
     server = startHubServer(handlers, lock.token, lock.port, ctx);
+    await writeLock(lock); // хаб слушает — теперь публикуем координаты в lock
     return { name: me.displayName };
   }
 

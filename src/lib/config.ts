@@ -84,6 +84,13 @@ async function readFileConfig(): Promise<Partial<Config>> {
   }
 }
 
+/** Конфиг как он ЗАПИСАН в файле (без наложения env). Нужно там, где важно сравнить с
+ *  персистентным значением, а не с effective (например, сменился ли токен бота на диске —
+ *  effective мог быть перекрыт TG_BOT_TOKEN). */
+export async function loadFileConfig(): Promise<Partial<Config>> {
+  return readFileConfig();
+}
+
 /** Полная конфигурация с учётом env и файла. apiId/apiHash могут быть undefined. */
 export async function loadConfig(): Promise<Partial<Config>> {
   const f = await readFileConfig();
@@ -123,7 +130,7 @@ export async function requireConfig(): Promise<Config> {
   const c = await loadConfig();
   if (!c.apiId || !c.apiHash) {
     throw new Error(
-      "Нет API-кредов Telegram. Запустите `bun run login` (или задайте TG_API_ID/TG_API_HASH).",
+      "Нет API-кредов Telegram. Запустите `bun run tg login <имя>` (или задайте TG_API_ID/TG_API_HASH).",
     );
   }
   return c as Config;

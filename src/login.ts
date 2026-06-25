@@ -1,15 +1,15 @@
-// Интерактивный вход в личный Telegram.
-//   bun run login          — вход по QR-коду (по умолчанию): сканируете QR с телефона
-//   bun run login --code   — вход по коду (телефон → код → 2FA)
+// Интерактивный вход в личный Telegram (для КОНКРЕТНОГО пользователя/тенанта).
+//   bun run tg login <имя>          — вход по QR-коду (по умолчанию): сканируете QR
+//   bun run tg login <имя> --code   — вход по коду (телефон → код → 2FA)
 //
 // QR — основной способ: он надёжнее, когда код «via app» не доходит. На телефоне с
 // Telegram откройте Настройки → Устройства → Подключить устройство и наведите камеру
 // на QR из терминала. Облачный пароль (2FA), если включён, спросят после скана.
 //
 // api_id/api_hash берутся из конфигурации (есть встроенные по умолчанию). Сессия
-// сохраняется в data/session/account.session (bun:sqlite) и переиспользуется.
+// сохраняется в tenants/<имя>/session/account (bun:sqlite) и переиспользуется.
 //
-// НЕ запускайте login, пока работает сервис: хранилище сессии открывает один процесс.
+// НЕ запускайте login, пока работает сервис этого тенанта: сессию открывает один процесс.
 
 import { TelegramClient, tl } from "@mtcute/bun";
 import type { SentCode, User } from "@mtcute/bun";
@@ -18,7 +18,7 @@ import { mkdir } from "node:fs/promises";
 import { requireConfig } from "./lib/config.ts";
 import { sessionDir, sessionPath } from "./lib/paths.ts";
 import { ensureDataLayout } from "./lib/memory.ts";
-import { createTenant, tenantContext, tenantExists, withTenant } from "./lib/tenants.ts";
+import { createTenant, listTenants, tenantContext, tenantExists, withTenant } from "./lib/tenants.ts";
 
 function ask(question: string): string {
   const ans = prompt(question);
@@ -95,7 +95,7 @@ function explainDelivery(sent: SentCode, phone: string): void {
           "   Откройте Telegram на другом устройстве, где вы УЖЕ вошли (телефон/desktop/web),\n" +
           "   и найдите чат «Telegram» (официальный, синяя галочка, отправитель 777000) — код там.\n" +
           "   👉 Не приходит / нет доступа к тому устройству? Прервите (Ctrl+C) и войдите по QR:\n" +
-          "      bun run login --qr",
+          "      bun run tg login <имя>",
       );
       break;
     case "sms":
@@ -140,7 +140,7 @@ async function loginByCode(tg: TelegramClient): Promise<User> {
     }
     if (code.toLowerCase() === "resend") {
       if (!sent.nextType || sent.nextType === "none") {
-        console.log("Другого способа доставки нет. Войдите по QR: прервите и `bun run login --qr`.");
+        console.log("Другого способа доставки нет. Войдите по QR: прервите и `bun run tg login <имя>`.");
         continue;
       }
       sent = await tg.resendCode({ phone, phoneCodeHash: sent.phoneCodeHash });
@@ -185,7 +185,7 @@ async function loginByQr(tg: TelegramClient): Promise<User> {
   console.log(
     "Вход по QR-коду. На телефоне с Telegram: Настройки → Устройства →\n" +
       "Подключить устройство (Link Desktop Device) и наведите камеру на QR ниже.\n" +
-      "(Предпочитаете вход по коду? Прервите и запустите: bun run login --code)\n",
+      "(Предпочитаете вход по коду? Прервите и запустите: bun run tg login <имя> --code)\n",
   );
   return tg.signInQr({
     onUrlUpdated: (url) => {
@@ -228,16 +228,21 @@ async function run(): Promise<void> {
 }
 
 // Вход в КОНКРЕТНОГО тенанта: первый не-флаговый аргумент — имя тенанта (его сессия
-// ляжет в tenants/<имя>/). Без имени — legacy-папка data/ (TG_DATA_DIR).
+// ляжет в tenants/<имя>/). Имя ОБЯЗАТЕЛЬНО: без него — явная ошибка с подсказкой
+// (НИКАКОГО авто-выбора единственного тенанта — это скрытый дефолт).
 async function main(): Promise<void> {
   const name = process.argv.slice(2).find((a) => !a.startsWith("-"));
-  if (name) {
-    if (!(await tenantExists(name))) await createTenant(name);
-    console.log(`Вход в тенанта «${name}».`);
-    await withTenant(tenantContext(name, 0), run);
-  } else {
-    await run();
+  if (!name) {
+    const names = await listTenants();
+    const hint = names.length
+      ? `Укажи пользователя: bun run tg login <имя>. Доступные: ${names.join(", ")}.`
+      : `Сначала создай пользователя: bun run tg setup <имя> (или tenant add <имя>).`;
+    console.error(`Не указан пользователь (tenant). ${hint}`);
+    process.exit(1);
   }
+  if (!(await tenantExists(name))) await createTenant(name);
+  console.log(`Вход в тенанта «${name}».`);
+  await withTenant(tenantContext(name, 0), run);
 }
 
 main().catch((err) => {
