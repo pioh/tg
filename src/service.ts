@@ -314,6 +314,14 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     };
     inflight = Math.max(0, inflight - 1);
     replyTargets.shift(); // ход завершён — снимаем его цель ответа
+    // SDK может склеить несколько запушенных сообщений в один ход (один result),
+    // поэтому push-счётчик способен «уехать» выше реального числа ходов и не вернуться
+    // к нулю — тогда индикатор «печатает…» горит вечно, а applyPending не срабатывает.
+    // Пустая очередь в момент result = агент простаивает по определению: выравниваем счётчики.
+    if (queueEmpty) {
+      inflight = 0;
+      replyTargets = [];
+    }
     void persistAgent();
     if (inflight === 0 && queueEmpty) void applyPending();
   }
