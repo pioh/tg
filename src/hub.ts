@@ -35,6 +35,15 @@ function coercePeer(chatId: string): string | number {
   return /^-?\d+$/.test(s) ? Number(s) : s;
 }
 
+/** Управляющий канал «Избранного» считается ВЫКЛЮЧЕННЫМ, если controlChat пуст или равен
+ *  off/none/disabled/- (без учёта регистра). Тогда сервис не опрашивает Saved Messages —
+ *  команды берутся только из сервисного бота, а заметки владельца в «Избранном» не будят
+ *  сессию и не пишутся в QA. */
+function isControlDisabled(chat: string | undefined): boolean {
+  const s = String(chat ?? "").trim().toLowerCase();
+  return s === "" || s === "off" || s === "none" || s === "disabled" || s === "-";
+}
+
 /** Убирает undefined-поля, чтобы Object.assign не затирал обязательные поля при патче
  *  (JSON выкидывает undefined → раньше из-за этого у мониторов пропадали enabled/action). */
 function omitUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
@@ -149,7 +158,8 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
       // не дать перечитать собственное сообщение в управляющем канале как команду
       try {
         const cfg = await loadConfig();
-        const control = cfg.controlChat ?? "me";
+        const control = cfg.controlChat ?? "off";
+        if (isControlDisabled(control)) return res; // Saved-канал выключен — курсор не ведём
         const controlId = (await tg.getPeer(coercePeer(control))).id;
         if (res.chatPeerId === controlId) {
           const k = String(control);
@@ -165,7 +175,11 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
 
     control_poll: async () => {
       const cfg = await loadConfig();
-      const chat = cfg.controlChat ?? "me";
+      const chat = cfg.controlChat ?? "off";
+      // Управляющий канал «Избранного» можно выключить совсем (off/none/-/пусто):
+      // когда команды идут через сервисного бота, заметки владельца в Saved Messages
+      // не должны ни будить сессию, ни попадать в QA как команды.
+      if (isControlDisabled(chat)) return { controlChat: chat, newCommands: [], disabled: true };
       const peer = await tg.resolvePeer(coercePeer(chat));
       const meId = await meIdP();
       const key = String(chat);

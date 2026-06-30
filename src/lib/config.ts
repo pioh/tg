@@ -38,7 +38,10 @@ export interface Config {
   apiHash: string;
   /**
    * Управляющий канал — откуда агент берёт команды человека.
-   * "me"/"self" = «Избранное» (Saved Messages). Можно указать @username или id.
+   * По умолчанию "off" = опрос «Избранного» ВЫКЛЮЧЕН (команды идут через сервисного
+   * бота; заметки владельца в Saved Messages не будят сессию и не пишутся в QA).
+   * "me"/"self" = «Избранное» (Saved Messages); также можно @username или id —
+   * включить управление через конкретный чат. "off"/"none"/"-"/пусто = выключено.
    */
   controlChat: string;
   /** Какой движок запускать сервисом по умолчанию. */
@@ -68,7 +71,11 @@ const DEFAULT_API_ID = 25282;
 const DEFAULT_API_HASH = "b334f72ad1a3d4e3324894ccde2d2dab";
 
 const DEFAULTS: Omit<Config, "apiId" | "apiHash"> = {
-  controlChat: "me",
+  // По умолчанию опрос «Избранного» ВЫКЛЮЧЕН: канал команд — сервисный бот, а Saved
+  // Messages владелец использует как личный блокнот; его заметки не должны будить
+  // сессию. Кому нужно управление через «Избранное» — задать controlChat: "me" (или
+  // @username/id) в config.json либо TG_CONTROL_CHAT.
+  controlChat: "off",
   agent: "claude",
   model: "opus",
   intervalSeconds: 60,

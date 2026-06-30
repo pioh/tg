@@ -38,11 +38,21 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** Отвечает ли /health на этом порту (живой ли хаб). */
-async function hubHealthy(port: number): Promise<boolean> {
+/** Отвечает ли именно хаб из этого lock (живой порт + валидный bearer-токен). */
+async function hubHealthy(lock: LockInfo): Promise<boolean> {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(800) });
-    return res.ok;
+    const health = await fetch(`http://127.0.0.1:${lock.port}/health`, { signal: AbortSignal.timeout(800) });
+    if (!health.ok) return false;
+    const rpc = await fetch(`http://127.0.0.1:${lock.port}/rpc`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${lock.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ op: "__lock_healthcheck", args: {} }),
+      signal: AbortSignal.timeout(800),
+    });
+    return rpc.ok;
   } catch {
     return false;
   }
@@ -55,8 +65,8 @@ const LOCK_STARTUP_GRACE_MS = 60000;
 export async function serviceRunning(): Promise<LockInfo | null> {
   const lock = await readLock();
   if (!lock) return null;
-  // Надёжный признак «живой» — отвечает хаб на его порту.
-  if (await hubHealthy(lock.port)) return lock;
+  // Надёжный признак «живой» — отвечает хаб на его порту и принимает token из lock.
+  if (await hubHealthy(lock)) return lock;
   // Хаб не отвечает: считаем «запускается» ТОЛЬКО если pid жив И lock СВЕЖИЙ. Иначе это
   // stale (частый случай после ПЕРЕЗАГРУЗКИ: pid из lock переиспользован чужим процессом —
   // pidAlive=true, но это не наш сервис). Свежесть отсекает такие ложные срабатывания.
