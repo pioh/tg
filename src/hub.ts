@@ -15,6 +15,7 @@ import * as tgOps from "./telegram/ops.ts";
 import * as monitors from "./lib/monitors.ts";
 import * as bot from "./lib/bot.ts";
 import * as botusers from "./lib/botusers.ts";
+import * as botpolicy from "./lib/botpolicy.ts";
 import * as schedules from "./lib/schedules.ts";
 import {
   appendProgress,
@@ -63,14 +64,6 @@ function logAction(op: string, args: unknown, status: string): void {
   appendFile(actionsPath(), line + "\n", "utf8").catch(() => {});
 }
 
-// Сериализуем bot getUpdates (Telegram допускает только один getUpdates за раз).
-let botGate: Promise<unknown> = Promise.resolve();
-function botSerial<T>(fn: () => Promise<T>): Promise<T> {
-  const run = botGate.then(fn, fn);
-  botGate = run.catch(() => {});
-  return run;
-}
-
 type Args = Record<string, any>;
 export type Handlers = Record<string, (a: Args) => Promise<unknown>>;
 
@@ -89,6 +82,18 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
   let meIdCache: Promise<number> | undefined;
   const meIdP = (): Promise<number> => (meIdCache ??= tg.getMe().then((m) => m.id));
   const peerId = async (chat: string): Promise<number> => (await tg.getPeer(coercePeer(chat))).id;
+
+  // Сериализуем bot getUpdates ЭТОГО тенанта. Telegram допускает только один getUpdates
+  // за раз НА БОТА — а у каждого тенанта свой бот/токен, поэтому гейт ДОЛЖЕН быть
+  // per-tenant (в замыкании buildHandlers), а НЕ общий на модуль. Иначе длинный long-poll
+  // (timeout≈20с) одного тенанта держит общий гейт и задерживает подхват сообщений (и 👀)
+  // у остальных тенантов — «залипание» реакции до десятков секунд.
+  let botGate: Promise<unknown> = Promise.resolve();
+  const botSerial = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = botGate.then(fn, fn);
+    botGate = run.catch(() => {});
+    return run;
+  };
 
   // ОТПРАВКА СВОБОДНА: писать можно в любой чат. Раньше тут был code-level gate
   // (assertCanSend) — «кому можно писать». Его убрали (требование пользователя):
@@ -150,8 +155,24 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
       await assertSafeFile(a.path);
       return tgOps.sendFile(tg, a.chat, a.path, a.caption);
     },
+    send_photo: async (a) => {
+      await assertSafeFile(a.path);
+      return tgOps.sendPhoto(tg, a.chat, a.path, a.caption);
+    },
+    set_chat_photo: async (a) => {
+      await assertSafeFile(a.path);
+      return tgOps.setChatPhoto(tg, a.chat, a.path);
+    },
     list_topics: (a) => tgOps.listTopics(tg, a.chat, a.limit ?? 50),
     get_topic_history: (a) => tgOps.getTopicHistory(tg, a.chat, a.topic_id, a.limit ?? 30),
+
+    // --- Произвольный MTProto + управление группами/форумами (от имени аккаунта) ---
+    tg_api: (a) => tgOps.callApi(tg, a.method, a.params),
+    tg_create_forum_group: (a) => tgOps.createForumGroup(tg, a.title, a.description),
+    tg_create_topic: (a) => tgOps.createTopic(tg, a.chat, a.title, a.icon),
+    tg_add_members: (a) => tgOps.addMembers(tg, a.chat, a.users),
+    tg_promote_admin: (a) => tgOps.promoteAdmin(tg, a.chat, a.user),
+    tg_invite_link: (a) => tgOps.inviteLink(tg, a.chat),
 
     send_message: async (a) => {
       const res = await tgOps.sendMessage(tg, a.chat, a.text, a.reply_to);
@@ -266,9 +287,28 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
       return res;
     },
     bot_poll: async (a) => botSerial(async () => bot.botPoll(await meIdP(), a.timeout ?? 0)),
-    bot_send: (a) => bot.botSend(a.text, a.chat_id),
-    bot_progress: (a) => bot.botProgress(a.text, a.chat_id),
-    bot_typing: (a) => bot.botTyping(a.chat_id),
+    bot_send: (a) => bot.botSend(a.text, a.chat_id, a.message_thread_id),
+    bot_progress: (a) => bot.botProgress(a.text, a.chat_id, a.message_thread_id),
+    bot_typing: (a) => bot.botTyping(a.chat_id, a.message_thread_id),
+    // Произвольный вызов Bot API «от имени бота» (sendPoll/голосовалки и любой метод).
+    bot_api: (a) => bot.callBotApi(a.method, a.params),
+    // Привязка бота к группе+топику (topic-режим) программно.
+    bot_bind_topic: (a) => bot.bindBotTopic(a.chat_id, a.topic_id),
+
+    // --- Политика реакции бота в топике (на что реагировать / что игнорировать) ---
+    bot_policy_get: () => botpolicy.getPolicy(),
+    bot_policy_set: (a) =>
+      botpolicy.setPolicy(
+        omitUndefined({
+          reactTo: a.react_to,
+          ignoreUserIds: a.ignore_user_ids,
+          keywordsAny: a.keywords_any,
+          excludeKeywords: a.exclude_keywords,
+          mentionOnly: a.mention_only,
+          ignoreBots: a.ignore_bots,
+          minIntervalSec: a.min_interval_sec,
+        }),
+      ),
 
     // --- Кто может писать боту (allowlist; по умолчанию только владелец) ---
     bot_users_list: () => botusers.listBotUsers(),
@@ -294,7 +334,13 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
 
     // --- Расписания ---
     schedule_add: (a) =>
-      schedules.addSchedule({ name: a.name, everySec: a.every_sec, instruction: a.instruction, deliver: a.deliver }),
+      schedules.addSchedule({
+        name: a.name,
+        everySec: a.every_sec,
+        instruction: a.instruction,
+        deliver: a.deliver,
+        target: a.target_chat_id != null ? { chatId: a.target_chat_id, threadId: a.target_thread_id } : undefined,
+      }),
     schedule_list: () => schedules.listSchedules(),
     schedule_remove: async (a) => ({ removed: await schedules.removeSchedule(a.id) }),
     schedule_poll: async () => schedules.evaluateSchedules(Date.now()),

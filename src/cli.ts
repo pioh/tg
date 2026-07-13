@@ -258,6 +258,7 @@ function help(): void {
       `  service-help          как смотреть логи / останавливать / перезапускать сервис\n` +
       `  version               версия + проверка обновлений\n` +
       `  update                обновиться до последней версии (git pull + bun install)\n` +
+      `  update-deps           обновить зависимости до latest (проверка + авто-откат)\n` +
       `  mcp                   запустить MCP-сервер вручную\n` +
       `  doctor [--prepublish] проверить окружение (или готовность к публикации)\n` +
       `  qa <имя> "<текст>"    записать просьбу человека дословно (в папку пользователя)\n` +
@@ -300,6 +301,9 @@ async function main(): Promise<void> {
       break;
     case "update":
       await updateCmd();
+      break;
+    case "update-deps":
+      process.exit(await spawnBun(join("src", "update-deps.ts"), rest));
       break;
     case "mcp":
       process.exit(await spawnBun(MCP_SERVER_PATH));

@@ -248,6 +248,19 @@ async function api<T = any>(token: string, method: string, params?: Record<strin
   return data.result as T;
 }
 
+/**
+ * Произвольный вызов Bot API «от имени бота» (generic passthrough). Позволяет агенту
+ * использовать ЛЮБОЙ метод Bot API: sendPoll (голосовалки), pinChatMessage,
+ * editMessageText, setChatMenuButton, createChatInviteLink и т.д. — не заводя под каждый
+ * отдельный инструмент. Токен берётся из конфига тенанта. Возвращает `result` Telegram.
+ * ВНИМАНИЕ: доступны и деструктивные методы — вызывать только по явной просьбе человека.
+ */
+export async function callBotApi(method: string, params?: Record<string, unknown>) {
+  const cfg = await loadConfig();
+  if (!cfg.botToken) throw new Error("Бот не настроен. Сначала создайте бота и сохраните токен (bot_set_token).");
+  return api(cfg.botToken, method, params);
+}
+
 export async function botStatus() {
   const cfg = await loadConfig();
   if (!cfg.botToken) return { configured: false as const, hint: "Бота нет. Создайте через @BotFather и сохраните токен (bot_set_token)." };
@@ -265,6 +278,13 @@ export async function botStatus() {
   }
 }
 
+/** Привязать бота к группе (+ топику форума) программно — topic-режим без ручного /here.
+ *  chatId — id супергруппы (-100…); topicId — id топика (threadId) или undefined (вся группа). */
+export async function bindBotTopic(chatId: number, topicId?: number) {
+  await saveConfig({ botGroupChatId: chatId, botTopicId: topicId });
+  return { ok: true, botGroupChatId: chatId, botTopicId: topicId ?? null };
+}
+
 /** Проверяет токен (getMe) и сохраняет его + username в конфиг. Заодно регистрирует
  *  меню команд и описание бота, чтобы в Telegram сразу были подсказки. */
 export async function setBotToken(token: string) {
@@ -277,7 +297,7 @@ export async function setBotToken(token: string) {
   // /start (offset от прежнего бота). Сбрасываем — авто-/start зарегистрирует владельца заново.
   await saveConfig(
     tokenChanged
-      ? { botToken: token, botUsername: me.username, botOwnerChatId: undefined, botGroupChatId: undefined }
+      ? { botToken: token, botUsername: me.username, botOwnerChatId: undefined, botGroupChatId: undefined, botTopicId: undefined }
       : { botToken: token, botUsername: me.username },
   );
   if (tokenChanged) {
@@ -336,6 +356,10 @@ export interface BotIncoming {
   text: string;
   /** true, если написал сам владелец аккаунта (а не разрешённый пользователь). */
   isOwner: boolean;
+  /** id топика форума, если сообщение — в топике (иначе null). Для topic-режима бота. */
+  messageThreadId: number | null;
+  /** true, если отправитель — бот (для политики ignoreBots / защиты от петель бот↔бот). */
+  fromIsBot: boolean;
 }
 
 /** Тот, кто постучался боту в личке, но не в списке разрешённых (уведомить владельца). */
@@ -379,6 +403,11 @@ export async function botPoll(
     const isOwner = ownerId == null || fromId === ownerId;
     const isCmd = m.text.startsWith("/");
     const allowedMember = isOwner || (await isBotUserAllowed(fromId));
+    // Топик форума (для topic-режима бота). Обычные reply-цепочки тоже несут
+    // message_thread_id, поэтому истинный топик — только при is_topic_message.
+    const threadId: number | null = m.is_topic_message ? (m.message_thread_id ?? null) : null;
+    const fromIsBot = Boolean(m.from?.is_bot);
+    const topicMode = cfg.botGroupChatId != null && cfg.botTopicId != null;
 
     if (chatType === "private") {
       if (!allowedMember) {
@@ -388,7 +417,12 @@ export async function botPoll(
       if (isOwner) ownerChat = m.chat.id; // личка владельца для проактивных сообщений
     } else if (chatType === "group" || chatType === "supergroup") {
       const isAssistantGroup = cfg.botGroupChatId != null && m.chat.id === cfg.botGroupChatId;
-      if (isAssistantGroup) {
+      if (isAssistantGroup && topicMode) {
+        // topic-режим: обрабатываем ТОЛЬКО свой топик; в нём — сообщения ВСЕХ участников
+        // группы (общение и команды ото всех), кроме других ботов (защита от петель).
+        if (threadId !== cfg.botTopicId) continue;
+        if (fromIsBot) continue;
+      } else if (isAssistantGroup) {
         if (!allowedMember) continue; // в группе чужих игнорируем тихо (без уведомлений)
       } else {
         // не назначенная группа: принимаем только команды владельца (для /here).
@@ -409,6 +443,8 @@ export async function botPoll(
       chatType,
       text: m.text,
       isOwner,
+      messageThreadId: threadId,
+      fromIsBot,
     });
   }
 
@@ -425,17 +461,20 @@ export async function botPoll(
 // parse_mode "HTML" (HTML прощающее — экранируем только < > &, разметку ставим тегами,
 // поэтому случайные `_`/`.`/скобки не ломают парсинг). Фолбэк на обычный текст — ТОЛЬКО
 // как последняя страховка (если Telegram всё же отверг HTML), чтобы сообщение не пропало.
-async function sendOnePart(token: string, chat: number, text: string): Promise<{ message_id: number }> {
+async function sendOnePart(token: string, chat: number, text: string, threadId?: number): Promise<{ message_id: number }> {
+  // message_thread_id адресует сообщение в конкретный ТОПИК форума (topic-режим).
+  const thread = threadId != null ? { message_thread_id: threadId } : {};
   try {
-    return await api(token, "sendMessage", { chat_id: chat, text: mdToTelegramHtml(text), parse_mode: "HTML" });
+    return await api(token, "sendMessage", { chat_id: chat, text: mdToTelegramHtml(text), parse_mode: "HTML", ...thread });
   } catch {
-    return await api(token, "sendMessage", { chat_id: chat, text });
+    return await api(token, "sendMessage", { chat_id: chat, text, ...thread });
   }
 }
 
 /** Бот пишет человеку (по умолчанию — владельцу в его чат с ботом). Обычный Markdown
- *  агента конвертируется в Telegram HTML (с фолбэком на обычный текст), длинное — режется. */
-export async function botSend(text: string, chatId?: number) {
+ *  агента конвертируется в Telegram HTML (с фолбэком на обычный текст), длинное — режется.
+ *  threadId (опц.) — топик форума, куда слать (topic-режим). */
+export async function botSend(text: string, chatId?: number, threadId?: number) {
   const cfg = await loadConfig();
   if (!cfg.botToken) throw new Error("Бот не настроен. Сначала создайте бота и сохраните токен (bot_set_token).");
   const chat = chatId ?? cfg.botOwnerChatId;
@@ -445,26 +484,28 @@ export async function botSend(text: string, chatId?: number) {
   const parts = splitMessage(text);
   let last: { message_id: number } | undefined;
   for (const part of parts) {
-    last = await sendOnePart(cfg.botToken, chat, part);
+    last = await sendOnePart(cfg.botToken, chat, part, threadId);
   }
   await logBotChat("🤖 бот", text);
   return { ok: true, chatId: chat, messageId: last?.message_id ?? 0, text, parts: parts.length };
 }
 
 /** Стилизованное промежуточное «статус»-сообщение (видно, что идёт работа). */
-export async function botProgress(text: string, chatId?: number) {
-  return botSend(`💭 ${text}`, chatId);
+export async function botProgress(text: string, chatId?: number, threadId?: number) {
+  return botSend(`💭 ${text}`, chatId, threadId);
 }
 
 /** Показывает в чате бота статус «печатает…» (Bot API sendChatAction). Длится ~5с;
  *  чтобы держать индикатор, его надо переотправлять каждые ~4с, пока идёт работа. Если
- *  переотправка прекращается (агент ответил или умер) — индикатор гаснет сам. */
-export async function botTyping(chatId?: number) {
+ *  переотправка прекращается (агент ответил или умер) — индикатор гаснет сам.
+ *  threadId (опц.) — показывать индикатор в конкретном топике форума. */
+export async function botTyping(chatId?: number, threadId?: number) {
   const cfg = await loadConfig();
   if (!cfg.botToken) return { ok: false };
   const chat = chatId ?? cfg.botOwnerChatId;
   if (!chat) return { ok: false };
-  await api(cfg.botToken, "sendChatAction", { chat_id: chat, action: "typing" });
+  const thread = threadId != null ? { message_thread_id: threadId } : {};
+  await api(cfg.botToken, "sendChatAction", { chat_id: chat, action: "typing", ...thread });
   return { ok: true };
 }
 

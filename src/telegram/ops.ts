@@ -313,10 +313,87 @@ export async function sendFile(tg: TelegramClient, chatId: string, path: string,
   return { chatId, path, ok: true };
 }
 
+/** Отправить изображение именно как ФОТО (сжатое, не документ) — например для BotFather
+ *  /setuserpic, который принимает только фото. */
+export async function sendPhoto(tg: TelegramClient, chatId: string, path: string, caption?: string) {
+  const peer = await tg.resolvePeer(coercePeer(chatId));
+  await tg.sendMedia(peer, InputMedia.photo(`file:${path}`, caption ? { caption } : {}));
+  return { chatId, path, ok: true };
+}
+
+/** Установить фото (аватар) чата/группы/канала из файла на диске. */
+export async function setChatPhoto(tg: TelegramClient, chatId: string, path: string) {
+  const peer = await tg.resolvePeer(coercePeer(chatId));
+  await tg.setChatPhoto({ chatId: peer, type: "photo", media: `file:${path}` });
+  return { chatId, ok: true };
+}
+
 // Реакция-эмодзи на сообщение (например 👀 = «прочитал/увидел»). Это НЕ отметка
 // «прочитано» — счётчик непрочитанных не сбрасывается.
 export async function react(tg: TelegramClient, chatId: string, messageId: number, emoji = "👀") {
   const peer = await tg.resolvePeer(coercePeer(chatId));
   await tg.sendReaction({ chatId: peer, message: messageId, emoji });
   return { chatId, messageId, emoji, ok: true };
+}
+
+// ---------- произвольный MTProto (полный доступ к юзер-API) ----------
+
+/**
+ * Вызвать ЛЮБОЙ MTProto TL-метод от имени аккаунта: полный доступ к Telegram API
+ * (messages.*, channels.*, folders.*, account.* и т.д.). `method` — имя TL-метода
+ * (например "account.getAuthorizations"), `params` — его поля. ВНИМАНИЕ: peer'ы в сыром
+ * TL — это InputPeer-объекты (не @username); для типовых задач используй именованные
+ * tg_*-инструменты. Доступны и деструктивные методы — только по явной просьбе человека.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function callApi(tg: TelegramClient, method: string, params?: Record<string, unknown>): Promise<any> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return tg.call({ _: method, ...(params ?? {}) } as any);
+}
+
+// ---------- управление группами/форумами/участниками (от имени аккаунта) ----------
+
+/** Создать супергруппу-форум (с топиками). Возвращает id/имя/username чата. */
+export async function createForumGroup(tg: TelegramClient, title: string, description?: string) {
+  const chat = await tg.createSupergroup({ title, description, forum: true });
+  return { id: chat.id, title: chat.displayName ?? title, username: chat.username ?? null };
+}
+
+/** Создать топик форума. Возвращает topicId (= id, он же threadId для чтения/отправки). */
+export async function createTopic(tg: TelegramClient, chatId: string, title: string, icon?: number) {
+  const peer = await tg.resolvePeer(coercePeer(chatId));
+  const msg = await tg.createForumTopic({ chatId: peer, title, icon });
+  return { topicId: msg.id, title };
+}
+
+/** Добавить участников (id/@username) в чат. Возвращает, кого добавить не удалось (privacy). */
+export async function addMembers(tg: TelegramClient, chatId: string, users: (string | number)[]) {
+  const peer = await tg.resolvePeer(coercePeer(chatId));
+  const missing = await tg.addChatMembers(peer, users.map(coercePeer), {});
+  return { requested: users.length, missing: (missing ?? []).map((mi) => String(mi.userId)) };
+}
+
+/** Выдать пользователю/боту права администратора в чате (по умолчанию — набор для бота). */
+export async function promoteAdmin(tg: TelegramClient, chatId: string, userId: string) {
+  await tg.editAdminRights({
+    chatId: coercePeer(chatId),
+    userId: coercePeer(userId),
+    rights: {
+      changeInfo: true,
+      deleteMessages: true,
+      banUsers: true,
+      inviteUsers: true,
+      pinMessages: true,
+      manageTopics: true,
+      manageCall: true,
+    },
+  });
+  return { ok: true, chat: chatId, user: userId };
+}
+
+/** Получить (экспортировать) пригласительную ссылку чата — фолбэк, если добавить напрямую нельзя. */
+export async function inviteLink(tg: TelegramClient, chatId: string) {
+  const peer = await tg.resolvePeer(coercePeer(chatId));
+  const l = await tg.exportInviteLink(peer);
+  return { link: l.link };
 }

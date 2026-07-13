@@ -108,5 +108,7 @@ export const botUsersPath = (): string => join(dataDir(), "bot-users.json");
 // Мониторы и расписания тенанта.
 export const monitorsPath = (): string => join(dataDir(), "monitors.json");
 export const schedulesPath = (): string => join(dataDir(), "schedules.json");
+// Политика реакции бота в топике (на что реагировать / что игнорировать).
+export const botPolicyPath = (): string => join(dataDir(), "bot-policy.json");
 // Lock + рантайм-координаты сервиса тенанта (pid, порт хаба, bearer-токен RPC).
 export const lockPath = (): string => join(dataDir(), "service.lock");

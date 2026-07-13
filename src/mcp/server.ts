@@ -26,7 +26,7 @@ function failResult(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-const server = new McpServer({ name: "tg", version: "0.7.1" });
+const server = new McpServer({ name: "tg", version: "0.8.0" });
 
 // Координаты хаба переданы сервисом ЯВНО в env (live-MCP для агента) — тенант уже
 // зафиксирован, set_context не нужен.
@@ -117,9 +117,48 @@ proxy(
 );
 proxy("tg_resolve", { title: "Найти пользователя/чат", description: "Разрешить @username/id/телефон в id+имя+тип.", inputSchema: { query: z.string() } }, "resolve");
 proxy("tg_send_file", { title: "Отправить файл", description: "Отправить файл с диска (с подписью).", inputSchema: { chat: z.string(), path: z.string(), caption: z.string().optional() } }, "send_file");
+proxy("tg_send_photo", { title: "Отправить фото", description: "Отправить изображение именно как ФОТО (сжатое, не документ) — напр. для BotFather /setuserpic.", inputSchema: { chat: z.string(), path: z.string(), caption: z.string().optional() } }, "send_photo");
+proxy("tg_set_chat_photo", { title: "Поставить аву чата", description: "Установить фото (аватар) группы/чата/канала из файла на диске.", inputSchema: { chat: z.string(), path: z.string() } }, "set_chat_photo");
 proxy("tg_list_topics", { title: "Список топиков", description: "Топики чата-форума (forum=true в tg_list_dialogs).", inputSchema: { chat: z.string(), limit: z.number().int().min(1).max(200).optional() } }, "list_topics");
 proxy("tg_get_topic_history", { title: "История топика", description: "Сообщения конкретного топика форума.", inputSchema: { chat: z.string(), topic_id: z.number().int(), limit: z.number().int().min(1).max(100).optional() } }, "get_topic_history");
 proxy("tg_react", { title: "Реакция на сообщение", description: "Поставить эмодзи-реакцию (👀 = «увидел»). Это НЕ отметка прочитанным — счётчик непрочитанных не сбрасывается.", inputSchema: { chat: z.string(), message_id: z.number().int(), emoji: z.string().optional() } }, "react");
+
+// ===== Полный доступ к API Telegram (от имени аккаунта) + управление группами =====
+proxy(
+  "tg_api",
+  {
+    title: "Произвольный вызов Telegram API (юзер)",
+    description:
+      "Вызвать ЛЮБОЙ MTProto TL-метод от имени аккаунта — полный доступ к API (messages.*, channels.*, folders.*, account.* …). method — имя метода (напр. \"account.getAuthorizations\"), params — его поля. NB: peer'ы в сыром TL — это InputPeer-объекты, не @username; для типовых задач бери именованные tg_*-инструменты. Деструктивные методы — только по явной просьбе человека.",
+    inputSchema: { method: z.string().min(1), params: z.record(z.string(), z.unknown()).optional() },
+  },
+  "tg_api",
+);
+proxy(
+  "tg_create_forum_group",
+  { title: "Создать группу-форум", description: "Создать супергруппу с топиками (forum=true) от имени аккаунта. Возвращает id группы.", inputSchema: { title: z.string().min(1), description: z.string().optional() } },
+  "tg_create_forum_group",
+);
+proxy(
+  "tg_create_topic",
+  { title: "Создать топик форума", description: "Создать топик в группе-форуме. Возвращает topicId (он же threadId для чтения/отправки).", inputSchema: { chat: z.string(), title: z.string().min(1), icon: z.number().int().optional() } },
+  "tg_create_topic",
+);
+proxy(
+  "tg_add_members",
+  { title: "Добавить участников", description: "Добавить пользователей (id/@username) в чат. Вернёт, кого не удалось (privacy) — тогда используй tg_invite_link.", inputSchema: { chat: z.string(), users: z.array(z.string()).min(1) } },
+  "tg_add_members",
+);
+proxy(
+  "tg_promote_admin",
+  { title: "Сделать администратором", description: "Выдать пользователю/боту права админа в чате (набор для бота: управление топиками, закреп, удаление и т.д.).", inputSchema: { chat: z.string(), user: z.string() } },
+  "tg_promote_admin",
+);
+proxy(
+  "tg_invite_link",
+  { title: "Пригласительная ссылка", description: "Экспортировать invite-ссылку чата (фолбэк, если добавить участника напрямую нельзя).", inputSchema: { chat: z.string() } },
+  "tg_invite_link",
+);
 
 // tg_view_media — особый: для картинок возвращаем изображение инлайн (vision).
 (server.registerTool as any)(
@@ -181,8 +220,48 @@ proxy("bot_status", { title: "Статус бота", description: "Настро
 proxy("bot_set_token", { title: "Сохранить токен бота", description: "Сохранить токен от @BotFather (создание: /newbot через tg_send_message, см. rules/25-bot).", inputSchema: { token: z.string() } }, "bot_set_token");
 // Обычный ответ человеку НЕ требует bot_send: текстовый вывод агента сервис сам шлёт
 // человеку. bot_send нужен лишь для конкретного chat_id или проактивно.
-proxy("bot_send", { title: "Бот пишет в конкретный чат", description: "Отправить сообщение бота в конкретный chat_id или проактивно (по расписанию). Для обычного ответа НЕ нужен — просто выведи текст. Пиши обычным Markdown — сервис сам конвертирует в Telegram-HTML; длинное режется само.", inputSchema: { text: z.string().min(1), chat_id: z.number().int().optional() } }, "bot_send");
+proxy("bot_send", { title: "Бот пишет в конкретный чат", description: "Отправить сообщение бота в конкретный chat_id или проактивно (по расписанию). message_thread_id — топик форума (topic-режим). Для обычного ответа НЕ нужен — просто выведи текст. Пиши обычным Markdown — сервис сам конвертирует в Telegram-HTML; длинное режется само.", inputSchema: { text: z.string().min(1), chat_id: z.number().int().optional(), message_thread_id: z.number().int().optional() } }, "bot_send");
 proxy("bot_react", { title: "Реакция бота на сообщение", description: "Эмодзи-реакция на сообщение в чате бота (👀 = «увидел»).", inputSchema: { chat_id: z.number().int(), message_id: z.number().int(), emoji: z.string().optional() } }, "bot_react");
+proxy(
+  "bot_api",
+  {
+    title: "Произвольный вызов Bot API (бот)",
+    description:
+      "Вызвать ЛЮБОЙ метод Bot API «от имени бота»: sendPoll (голосовалки), pinChatMessage, editMessageText, createChatInviteLink и т.д. method — имя метода, params — его поля (в топик — message_thread_id). Деструктивные методы — только по явной просьбе человека.",
+    inputSchema: { method: z.string().min(1), params: z.record(z.string(), z.unknown()).optional() },
+  },
+  "bot_api",
+);
+proxy(
+  "bot_bind_topic",
+  {
+    title: "Привязать бота к группе+топику",
+    description: "Topic-режим: бот обрабатывает и отвечает ТОЛЬКО в указанном топике группы, команды принимает ото всех участников. chat_id — id супергруппы (-100…), topic_id — id топика (без него — вся группа). Требует выключенного privacy-mode у бота.",
+    inputSchema: { chat_id: z.number().int(), topic_id: z.number().int().optional() },
+  },
+  "bot_bind_topic",
+);
+
+// ===== Политика реакции бота в топике (на что реагировать / что игнорировать) =====
+proxy("bot_policy_get", { title: "Политика реакции бота", description: "Текущая политика: на что бот реагирует в топике, а что игнорирует.", inputSchema: {} }, "bot_policy_get");
+proxy(
+  "bot_policy_set",
+  {
+    title: "Настроить политику реакции бота",
+    description:
+      "Что бот слушает в своём топике. react_to: \"all\" (все) | \"owner\" (только владелец) | список id. ignore_user_ids — кого игнорировать. keywords_any — реагировать только на эти слова. exclude_keywords — игнорировать эти слова. mention_only — только при @упоминании. ignore_bots — игнорировать ботов (деф. true). min_interval_sec — не чаще раза в N сек. Передавай только меняемые поля.",
+    inputSchema: {
+      react_to: z.union([z.enum(["all", "owner"]), z.array(z.number().int())]).optional(),
+      ignore_user_ids: z.array(z.number().int()).optional(),
+      keywords_any: z.array(z.string()).optional(),
+      exclude_keywords: z.array(z.string()).optional(),
+      mention_only: z.boolean().optional(),
+      ignore_bots: z.boolean().optional(),
+      min_interval_sec: z.number().int().min(0).optional(),
+    },
+  },
+  "bot_policy_set",
+);
 
 // ===== Кто может писать боту (allowlist; по умолчанию только владелец) =====
 proxy("bot_users_list", { title: "Кто может писать боту", description: "Список пользователей (помимо владельца), которым разрешено писать сервисному боту.", inputSchema: {} }, "bot_users_list");
@@ -190,7 +269,7 @@ proxy("bot_user_allow", { title: "Разрешить писать боту", des
 proxy("bot_user_deny", { title: "Запретить писать боту", description: "Убрать пользователя из списка разрешённых писать боту.", inputSchema: { user: z.string() } }, "bot_user_deny");
 
 // ===== Расписания =====
-proxy("schedule_add", { title: "Создать расписание", description: "Периодическая задача: каждые every_sec выполнять instruction, доставлять deliver (bot/saved). Только по явной просьбе.", inputSchema: { name: z.string(), every_sec: z.number().int().min(30), instruction: z.string(), deliver: z.enum(["bot", "saved"]).optional() } }, "schedule_add");
+proxy("schedule_add", { title: "Создать расписание", description: "Периодическая задача: каждые every_sec выполнять instruction, доставлять deliver (bot/saved). Для проактива «от имени бота» в конкретный чат/топик задай target_chat_id (+ target_thread_id — топик форума). Только по явной просьбе.", inputSchema: { name: z.string(), every_sec: z.number().int().min(30), instruction: z.string(), deliver: z.enum(["bot", "saved"]).optional(), target_chat_id: z.number().int().optional(), target_thread_id: z.number().int().optional() } }, "schedule_add");
 proxy("schedule_list", { title: "Список расписаний", description: "Все расписания.", inputSchema: {} }, "schedule_list");
 proxy("schedule_remove", { title: "Удалить расписание", description: "Удалить по id.", inputSchema: { id: z.string() } }, "schedule_remove");
 // schedule_poll НЕ публикуется (двигает lastRunAt) — созревшие задачи отдаёт сервис как события.

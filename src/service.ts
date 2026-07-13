@@ -12,8 +12,9 @@
 //
 // Флаг --once: один проход по каждому тенанту и выход (для проверки/cron).
 
-import { requireConfig, saveConfig, normalizeEffort } from "./lib/config.ts";
+import { requireConfig, loadConfig, saveConfig, normalizeEffort } from "./lib/config.ts";
 import { registerBotCommands } from "./lib/bot.ts";
+import * as botpolicy from "./lib/botpolicy.ts";
 import { checkForUpdate, applyUpdate, currentVersion } from "./lib/update.ts";
 import { managedBy } from "./lib/service-install.ts";
 import { createClient, hasSession } from "./telegram/client.ts";
@@ -29,6 +30,9 @@ import { autoMigrateLegacy, listTenants, tenantContext, withTenant } from "./lib
 
 const DETECT_SECONDS = Number(process.env.TG_DETECT_SECONDS ?? 3);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// Цель ответа текущего хода: чат и (для topic-режима) топик форума, КУДА уйдёт текст.
+type ReplyTarget = { chatId?: number; threadId?: number };
 
 const LIVE_INTRO = `Ты — живая сессия агента личного Telegram. Тебе НА ЛЕТУ приходят события (новые
 сообщения, команды, сработавшие мониторы/расписания) — реагируй по правилам и памяти.
@@ -190,14 +194,14 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   let pendingMode: "fresh" | "keep" | null = null;
   let resetRequested = false;
   // Буфер событий на время пересоздания/рестарта сессии (с целью ответа).
-  let pendingBuffer: { obj: unknown; target: number | undefined }[] = [];
+  let pendingBuffer: { obj: unknown; target: ReplyTarget | undefined }[] = [];
   let applying = false;
 
   // FIFO целей ответа: на каждое запушенное событие — чат, КУДА уйдёт текст этого хода.
   // forwardAgentText шлёт в голову очереди (текущий ход), onTurnEnd её сдвигает. Так
   // ответ не «утечёт» в чужой чат при чередовании сообщений из разных чатов/групп.
-  let replyTargets: (number | undefined)[] = [];
-  const currentTarget = (): number | undefined => replyTargets[0];
+  let replyTargets: (ReplyTarget | undefined)[] = [];
+  const currentTarget = (): ReplyTarget | undefined => replyTargets[0];
   let forwardGate: Promise<unknown> = Promise.resolve();
   const notifiedUnknown = new Set<number>();
 
@@ -218,8 +222,10 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   function forwardAgentText(text: string): void {
     const t = text.trim();
     if (!t) return;
-    const chatId = currentTarget();
-    forwardGate = forwardGate.then(() => handlers?.bot_send?.({ text: t, chat_id: chatId }).catch(() => {}));
+    const tgt = currentTarget();
+    forwardGate = forwardGate.then(() =>
+      handlers?.bot_send?.({ text: t, chat_id: tgt?.chatId, message_thread_id: tgt?.threadId }).catch(() => {}),
+    );
   }
 
   async function notifyUnauthorized(list: { fromId: number; fromUsername: string | null }[]): Promise<void> {
@@ -353,7 +359,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     for (const e of buf) pushEvent(e.obj, e.target);
   }
 
-  function pushEvent(obj: unknown, target?: number): void {
+  function pushEvent(obj: unknown, target?: ReplyTarget): void {
     // Пока сессия пересоздаётся/рестартится (watchdog) — копим события (с целью ответа),
     // чтобы не пушить в мёртвую очередь и не терять их. crashStopped — сессия мертва.
     if (crashStopped) {
@@ -388,13 +394,23 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
 
   async function handleBotMessages(msgs: any[]): Promise<void> {
     const h = handlers!;
+    // topic-режим определяем по КОНФИГУ (как в botPoll), а не по наличию threadId в
+    // сообщении: бот привязан к топику ⇔ заданы и botGroupChatId, и botTopicId. Так две
+    // ветки согласованы; обычная ассистент-группа (без botTopicId) остаётся в прежней
+    // логике (команды только владельца), даже если её сделали форумом.
+    const cfg = await loadConfig();
+    const topicBound = cfg.botGroupChatId != null && cfg.botTopicId != null;
     for (const m of msgs) {
+      const threadId: number | undefined = typeof m.messageThreadId === "number" ? m.messageThreadId : undefined;
+      // В topic-режиме команды принимаем ото ВСЕХ участников группы, ответы — в этот топик.
+      const topicMode = topicBound && threadId === cfg.botTopicId;
       await h.bot_react!({ chat_id: m.chatId, message_id: m.messageId }).catch(() => {});
       const text = String(m.text).trim();
       const lower = text.toLowerCase();
       const isOwner = m.isOwner !== false;
+      const canCommand = isOwner || topicMode;
       const to = m.chatId as number;
-      const reply = (t: string) => h.bot_send!({ text: t, chat_id: to }).catch(() => {});
+      const reply = (t: string) => h.bot_send!({ text: t, chat_id: to, message_thread_id: threadId }).catch(() => {});
       const arg = text.replace(/^\/\S+\s*/, "").trim();
       const isCmd = lower.startsWith("/");
       // В группах команда приходит как «/cmd@botusername [args]».
@@ -409,7 +425,13 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
         await reply(helpText(isOwner));
         continue;
       }
-      if (isCmd && !isOwner) {
+      // Глобальные/опасные команды процесса — НЕ из детских топиков (затрагивают всех
+      // тенантов). Управление процессом идёт через личный бот управления владельца.
+      if (topicMode && (cmd === "/update" || cmd === "/restart")) {
+        await reply("Команды /update и /restart — из личного бота управления, не из общего топика.");
+        continue;
+      }
+      if (isCmd && !canCommand) {
         await reply("Эта команда доступна только владельцу бота. Просто напиши, что нужно — я отвечу.");
         continue;
       }
@@ -478,7 +500,14 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
         else await reply("Я запущен не как сервис (foreground) — перезапусти вручную (Ctrl+C + `bun run service`) или поставь сервис: `bun run tg install-service`.");
       } else if (cmd === "/here") {
         if (m.chatType === "private") {
-          await reply("Команда /here — для группы. Добавь меня в общую (например, семейную) группу и отправь там /here — я начну отвечать всем разрешённым участникам.");
+          await reply("Команда /here — для группы. Добавь меня в общую (например, семейную) группу и отправь там /here — я начну отвечать всем разрешённым участникам. Отправь /here ВНУТРИ ТОПИКА, чтобы привязать меня именно к нему.");
+        } else if (threadId != null) {
+          await saveConfig({ botGroupChatId: to, botTopicId: threadId });
+          await reply(
+            "✅ Привязал(а) себя к этому топику: отвечаю ТОЛЬКО здесь, команды принимаю ото всех участников группы.\n" +
+              "⚠️ Выключи мой privacy у @BotFather (/mybots → бот → Bot Settings → Group Privacy → Turn off), иначе я не вижу обычные сообщения.\n" +
+              "Отвязать — /forgethere.",
+          );
         } else {
           await saveConfig({ botGroupChatId: to });
           await reply(
@@ -488,8 +517,8 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
           );
         }
       } else if (cmd === "/forgethere") {
-        await saveConfig({ botGroupChatId: undefined });
-        await reply("🚫 Больше не отвечаю в группах автоматически (ассистент-группа сброшена).");
+        await saveConfig({ botGroupChatId: undefined, botTopicId: undefined });
+        await reply("🚫 Больше не отвечаю в группах автоматически (ассистент-группа/топик сброшены).");
       } else if (cmd === "/monitors") {
         await reply(fmtMonitors((await h.monitor_list!({}).catch(() => [])) as any[]));
       } else if (cmd === "/schedules") {
@@ -523,9 +552,17 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       } else if (isCmd) {
         await reply("Неизвестная команда. /help — список команд.");
       } else {
-        // обычный текст → событие агенту; ответ уйдёт его текстом В ЭТОТ чат (target=to).
-        await h.bot_typing!({ chat_id: to }).catch(() => {});
-        pushEvent({ botMessages: [m], replyTo: { chatId: to, isOwner } }, to);
+        // обычный текст → событие агенту; ответ уйдёт его текстом В ЭТОТ чат/топик.
+        // В topic-режиме политика решает, будить ли агента (на что реагировать/что нет).
+        if (topicMode) {
+          const dec = await botpolicy.shouldReact({ fromId: m.fromId, isOwner, fromIsBot: Boolean(m.fromIsBot), text }, botUsername, Date.now());
+          if (!dec.react) {
+            lg(`политика: пропускаю сообщение (${dec.reason})`);
+            continue;
+          }
+        }
+        await h.bot_typing!({ chat_id: to, message_thread_id: threadId }).catch(() => {});
+        pushEvent({ botMessages: [m], replyTo: { chatId: to, isOwner, threadId } }, { chatId: to, threadId });
       }
     }
   }
@@ -611,7 +648,10 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     // индикатор «печатает…», пока агент работает
     (async () => {
       while (!stopping && !globalStopping) {
-        if (inflight > 0) await h.bot_typing!({ chat_id: currentTarget() }).catch(() => {});
+        if (inflight > 0) {
+          const tgt = currentTarget();
+          await h.bot_typing!({ chat_id: tgt?.chatId, message_thread_id: tgt?.threadId }).catch(() => {});
+        }
         await sleep(4000);
       }
     })();

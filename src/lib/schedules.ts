@@ -10,12 +10,20 @@ import { atomicWriteJson } from "./atomic.ts";
 
 export type DeliverTo = "bot" | "saved";
 
+/** Куда доставлять проактивный результат «от имени бота»: конкретный чат и (опц.) топик
+ *  форума. Если задан — агент публикует результат bot_send в этот chat_id/thread. */
+export interface ScheduleTarget {
+  chatId?: number;
+  threadId?: number;
+}
+
 export interface Schedule {
   id: string;
   name: string;
   everySec: number;
   instruction: string; // что сделать (агент интерпретирует)
   deliver: DeliverTo;
+  target?: ScheduleTarget; // куда постить (для deliver:"bot" в конкретный чат/топик)
   enabled: boolean;
   lastRunAt?: number; // epoch ms
 }
@@ -48,6 +56,7 @@ export interface AddScheduleInput {
   everySec: number;
   instruction: string;
   deliver?: DeliverTo;
+  target?: ScheduleTarget;
 }
 export async function addSchedule(input: AddScheduleInput): Promise<Schedule> {
   const data = await load();
@@ -57,6 +66,7 @@ export async function addSchedule(input: AddScheduleInput): Promise<Schedule> {
     everySec: input.everySec,
     instruction: input.instruction,
     deliver: input.deliver ?? "bot",
+    target: input.target,
     enabled: true,
   };
   data.schedules.push(s);
@@ -87,6 +97,7 @@ export interface DueSchedule {
   name: string;
   instruction: string;
   deliver: DeliverTo;
+  target?: ScheduleTarget;
 }
 /** Возвращает созревшие задачи и помечает их выполненными (lastRunAt = now). */
 export async function evaluateSchedules(nowMs: number): Promise<DueSchedule[]> {
@@ -99,7 +110,7 @@ export async function evaluateSchedules(nowMs: number): Promise<DueSchedule[]> {
     if (s.lastRunAt && nowMs - s.lastRunAt < s.everySec * 1000) continue;
     s.lastRunAt = nowMs;
     changed = true;
-    due.push({ id: s.id, name: s.name, instruction: s.instruction, deliver: s.deliver });
+    due.push({ id: s.id, name: s.name, instruction: s.instruction, deliver: s.deliver, target: s.target });
   }
   if (changed) await save(data);
   return due;

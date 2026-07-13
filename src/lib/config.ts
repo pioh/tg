@@ -61,6 +61,10 @@ export interface Config {
   /** chat_id «ассистент-группы» (семья): там бот отвечает на ВСЕ сообщения разрешённых
    *  участников. Назначается командой /here в группе. Требует выключенного privacy-mode. */
   botGroupChatId?: number;
+  /** id топика форума, к которому ПРИВЯЗАН бот (topic-режим). Когда задан вместе с
+   *  botGroupChatId — бот обрабатывает и отвечает ТОЛЬКО в этом топике, команды принимает
+   *  ото всех участников группы. Назначается /here, вызванной внутри топика. */
+  botTopicId?: number;
 }
 
 // Встроенные api_id/api_hash (как в исходной заготовке base.js) — чтобы `login`
@@ -129,6 +133,7 @@ export async function loadConfig(): Promise<Partial<Config>> {
     botUsername: f.botUsername,
     botOwnerChatId: f.botOwnerChatId,
     botGroupChatId: f.botGroupChatId,
+    botTopicId: f.botTopicId,
   };
 }
 
