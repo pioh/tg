@@ -360,6 +360,28 @@ export interface BotIncoming {
   messageThreadId: number | null;
   /** true, если отправитель — бот (для политики ignoreBots / защиты от петель бот↔бот). */
   fromIsBot: boolean;
+  /** тип медиа сообщения (photo/sticker/voice/video/document/…), null — только текст.
+   *  Само изображение агент смотрит через tg_view_media(chat, message_id) юзер-аккаунтом. */
+  media: string | null;
+}
+
+/** Тип медиа в сообщении Bot API — чтобы доставлять агенту НЕтекстовые сообщения
+ *  (раньше они молча отбрасывались). null — медиа нет (чистый текст или сервисное). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function botMediaKind(m: any): string | null {
+  if (m.photo) return "photo";
+  if (m.sticker) return "sticker";
+  if (m.animation) return "animation";
+  if (m.video) return "video";
+  if (m.video_note) return "video_note";
+  if (m.voice) return "voice";
+  if (m.audio) return "audio";
+  if (m.document) return "document";
+  if (m.contact) return "contact";
+  if (m.location) return "location";
+  if (m.poll) return "poll";
+  if (m.dice) return "dice";
+  return null;
 }
 
 /** Тот, кто постучался боту в личке, но не в списке разрешённых (уведомить владельца). */
@@ -396,12 +418,18 @@ export async function botPoll(
   for (const u of updates) {
     maxUpd = Math.max(maxUpd, u.update_id);
     const m = u.message;
-    if (!m || typeof m.text !== "string" || m.text.length === 0) continue;
+    if (!m) continue;
+    // Текст берём из text ИЛИ caption (у медиа с подписью текста нет). Медиа-тип — чтобы
+    // доставлять фото/стикеры/голос и т.п. (раньше они молча отбрасывались). Пропускаем
+    // только полностью пустые/сервисные сообщения (нет ни текста, ни медиа).
+    const media = botMediaKind(m);
+    const text: string = typeof m.text === "string" ? m.text : typeof m.caption === "string" ? m.caption : "";
+    if (!text && !media) continue;
     const chatType = m.chat?.type as string | undefined;
     const fromId = m.from?.id as number | undefined;
     if (fromId == null || !chatType) continue;
     const isOwner = ownerId == null || fromId === ownerId;
-    const isCmd = m.text.startsWith("/");
+    const isCmd = text.startsWith("/");
     const allowedMember = isOwner || (await isBotUserAllowed(fromId));
     // Топик форума (для topic-режима бота). Обычные reply-цепочки тоже несут
     // message_thread_id, поэтому истинный топик — только при is_topic_message.
@@ -432,8 +460,9 @@ export async function botPoll(
       continue; // каналы и пр. — игнор
     }
 
-    await recordQa(m.text, `bot:${m.from?.username ?? fromId}`);
-    await logBotChat(isOwner ? "👤 человек" : `👥 ${m.from?.username ?? fromId}`, m.text);
+    const logText = text || `[${media}]`;
+    await recordQa(logText, `bot:${m.from?.username ?? fromId}`);
+    await logBotChat(isOwner ? "👤 человек" : `👥 ${m.from?.username ?? fromId}`, logText);
     out.push({
       updateId: u.update_id,
       messageId: m.message_id,
@@ -441,10 +470,11 @@ export async function botPoll(
       fromUsername: m.from?.username ?? null,
       chatId: m.chat.id,
       chatType,
-      text: m.text,
+      text,
       isOwner,
       messageThreadId: threadId,
       fromIsBot,
+      media,
     });
   }
 

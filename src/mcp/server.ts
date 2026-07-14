@@ -26,7 +26,7 @@ function failResult(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-const server = new McpServer({ name: "tg", version: "0.8.0" });
+const server = new McpServer({ name: "tg", version: "0.8.1" });
 
 // Координаты хаба переданы сервисом ЯВНО в env (live-MCP для агента) — тенант уже
 // зафиксирован, set_context не нужен.
@@ -116,8 +116,8 @@ proxy(
   "mark_read",
 );
 proxy("tg_resolve", { title: "Найти пользователя/чат", description: "Разрешить @username/id/телефон в id+имя+тип.", inputSchema: { query: z.string() } }, "resolve");
-proxy("tg_send_file", { title: "Отправить файл", description: "Отправить файл с диска (с подписью).", inputSchema: { chat: z.string(), path: z.string(), caption: z.string().optional() } }, "send_file");
-proxy("tg_send_photo", { title: "Отправить фото", description: "Отправить изображение именно как ФОТО (сжатое, не документ) — напр. для BotFather /setuserpic.", inputSchema: { chat: z.string(), path: z.string(), caption: z.string().optional() } }, "send_photo");
+proxy("tg_send_file", { title: "Отправить файл", description: "Отправить файл с диска (с подписью). reply_to — id сообщения или топика форума.", inputSchema: { chat: z.string(), path: z.string(), caption: z.string().optional(), reply_to: z.number().int().optional() } }, "send_file");
+proxy("tg_send_photo", { title: "Отправить фото", description: "Отправить изображение как ФОТО (сжатое, не документ) — напр. для BotFather /setuserpic. reply_to — id сообщения или топика форума.", inputSchema: { chat: z.string(), path: z.string(), caption: z.string().optional(), reply_to: z.number().int().optional() } }, "send_photo");
 proxy("tg_set_chat_photo", { title: "Поставить аву чата", description: "Установить фото (аватар) группы/чата/канала из файла на диске.", inputSchema: { chat: z.string(), path: z.string() } }, "set_chat_photo");
 proxy("tg_list_topics", { title: "Список топиков", description: "Топики чата-форума (forum=true в tg_list_dialogs).", inputSchema: { chat: z.string(), limit: z.number().int().min(1).max(200).optional() } }, "list_topics");
 proxy("tg_get_topic_history", { title: "История топика", description: "Сообщения конкретного топика форума.", inputSchema: { chat: z.string(), topic_id: z.number().int(), limit: z.number().int().min(1).max(100).optional() } }, "get_topic_history");

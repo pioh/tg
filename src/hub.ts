@@ -153,11 +153,11 @@ export function buildHandlers(tg: TelegramClient, ctx?: AgentSessionCtx): Handle
     view_media: (a) => tgOps.getMedia(tg, a.chat, a.message_id),
     send_file: async (a) => {
       await assertSafeFile(a.path);
-      return tgOps.sendFile(tg, a.chat, a.path, a.caption);
+      return tgOps.sendFile(tg, a.chat, a.path, a.caption, a.reply_to);
     },
     send_photo: async (a) => {
       await assertSafeFile(a.path);
-      return tgOps.sendPhoto(tg, a.chat, a.path, a.caption);
+      return tgOps.sendPhoto(tg, a.chat, a.path, a.caption, a.reply_to);
     },
     set_chat_photo: async (a) => {
       await assertSafeFile(a.path);

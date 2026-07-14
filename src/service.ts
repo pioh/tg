@@ -259,6 +259,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       hubToken,
       codexResumeThreadId: codexThreadId,
       onText: forwardAgentText,
+      trace: (line) => lg(line), // читаемый ход агента (мысли/тулы/результаты) в журнал
       onTurnEnd,
       onThreadId: (id) => {
         codexThreadId = id;

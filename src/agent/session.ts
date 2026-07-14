@@ -12,7 +12,47 @@
 import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { REPO_ROOT, MCP_SERVER_PATH } from "../lib/paths.ts";
 import { log } from "../lib/log.ts";
+import { redact } from "../lib/redact.ts";
 import { createCodexEngine } from "./codex.ts";
+
+// ---- Читаемый трейс хода агента (мысли/вызовы тулов/результаты) в журнал ----
+// Форматируем в человекочитаемый вид (НЕ сырой JSON), секреты маскируем (redact),
+// длинные значения обрезаем. Лимит на строку — TG_TRACE_MAX (по умолчанию 2000).
+const TRACE_MAX = Math.max(200, Number(process.env.TG_TRACE_MAX ?? 2000));
+function clip(s: string, max = TRACE_MAX): string {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  return t.length > max ? t.slice(0, max) + "…" : t;
+}
+function fmtVal(v: unknown): string {
+  if (typeof v === "string") return v.length > 200 ? v.slice(0, 200) + "…" : v;
+  if (v === null || v === undefined || typeof v !== "object") return String(v);
+  try {
+    const s = JSON.stringify(v);
+    return s.length > 200 ? s.slice(0, 200) + "…" : s;
+  } catch {
+    return "?";
+  }
+}
+/** Аргументы вызова инструмента в виде `key=value, key=value` (не JSON), с маскировкой. */
+function fmtArgs(input: unknown): string {
+  const red = redact(input);
+  if (!red || typeof red !== "object" || Array.isArray(red)) return fmtVal(red);
+  return Object.entries(red as Record<string, unknown>)
+    .map(([k, v]) => `${k}=${fmtVal(v)}`)
+    .join(", ");
+}
+/** Результат инструмента коротко и читаемо (текст/`[image]`/…), с маскировкой. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function fmtToolResult(b: any): string {
+  const c = redact(b?.content);
+  let s: string;
+  if (typeof c === "string") s = c;
+  else if (Array.isArray(c))
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    s = c.map((x: any) => (x?.type === "text" ? x.text : x?.type === "image" ? "[image]" : (x?.type ?? ""))).join(" ");
+  else s = String(c ?? "");
+  return (b?.is_error ? "❌ " : "") + clip(s, 400);
+}
 
 export interface TurnUsage {
   inputTokens: number;
@@ -33,6 +73,8 @@ export interface SessionOpts {
   /** threadId для движка codex (непрерывность между рестартами). */
   codexResumeThreadId?: string;
   onText?: (text: string) => void;
+  /** Читаемый трейс хода агента (мысли/вызовы тулов/результаты) — в журнал сервиса. */
+  trace?: (line: string) => void;
   onTurnEnd?: (usage: TurnUsage, sessionId: string | undefined, queueEmpty: boolean) => void;
   /** codex: сообщить актуальный threadId для сохранения на диск. */
   onThreadId?: (threadId: string) => void;
@@ -88,6 +130,10 @@ function createClaudeSession(opts: SessionOpts): AgentSession {
   const queue = new WaitQueue();
   let sessionId = opts.resume;
   let closed = false;
+  const trace = (line: string): void => (opts.trace ? opts.trace(line) : log(line));
+  const toolNames = new Map<string, string>(); // tool_use_id → имя инструмента (для результатов)
+  let thinkingBuf = ""; // накопитель thinking_delta (текст мысли идёт частями)
+  let inThinking = false;
 
   async function* input(): AsyncGenerator<SDKUserMessage> {
     for await (const content of queue.iter()) {
@@ -104,6 +150,10 @@ function createClaudeSession(opts: SessionOpts): AgentSession {
       // Полные права без подтверждений (как Claude Code с --dangerously-skip-permissions):
       // все инструменты, включая Bash. Это личный локальный инструмент владельца.
       permissionMode: "bypassPermissions",
+      // В streaming-режиме (prompt = AsyncIterable) блоки thinking НЕ попадают в
+      // консолидированное assistant-сообщение без этого флага — включаем, чтобы мысли
+      // агента были видны в трейсе журнала. Частичные stream_event-события игнорируем.
+      includePartialMessages: true,
       settingSources: [],
       ...(opts.resume ? { resume: opts.resume } : {}),
       systemPrompt: { type: "preset", preset: "claude_code", append: opts.append },
@@ -123,11 +173,46 @@ function createClaudeSession(opts: SessionOpts): AgentSession {
       for await (const m of q) {
         if (m.type === "system" && m.subtype === "init") {
           sessionId = m.session_id;
+        } else if (m.type === "stream_event") {
+          // В streaming-режиме ТЕКСТ мысли (thinking) приходит только частичными
+          // дельтами — копим их и выводим 💭 по завершении блока (в консолидированном
+          // assistant thinking-текст пустой). Текстовые дельты игнорируем — готовый текст
+          // берём из assistant-сообщения ниже.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const ev = (m as any).event;
+          if (ev?.type === "content_block_start" && ev.content_block?.type === "thinking") {
+            inThinking = true;
+            thinkingBuf = "";
+          } else if (ev?.type === "content_block_delta" && ev.delta?.type === "thinking_delta") {
+            thinkingBuf += ev.delta.thinking ?? "";
+          } else if (ev?.type === "content_block_stop" && inThinking) {
+            if (thinkingBuf.trim()) trace(`💭 ${clip(thinkingBuf)}`);
+            inThinking = false;
+            thinkingBuf = "";
+          }
         } else if (m.type === "assistant") {
-          for (const b of m.message.content) {
+          // Текст ответа и вызовы инструментов (мысли — через stream_event выше).
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          for (const b of m.message.content as any[]) {
             if (b.type === "text") {
-              log("claude:", b.text.slice(0, 400));
+              trace(`💬 ${clip(b.text)}`);
               opts.onText?.(b.text);
+            } else if (b.type === "tool_use") {
+              if (b.id && b.name) toolNames.set(b.id, b.name);
+              trace(`🔧 ${b.name}(${fmtArgs(b.input)})`);
+            }
+          }
+        } else if (m.type === "user") {
+          // Результаты инструментов приходят как user-сообщение с блоками tool_result.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const content = (m as any).message?.content;
+          if (Array.isArray(content)) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            for (const b of content as any[]) {
+              if (b?.type === "tool_result") {
+                const name = toolNames.get(b.tool_use_id) ?? "tool";
+                trace(`↳ ${name}: ${fmtToolResult(b)}`);
+              }
             }
           }
         } else if (m.type === "result") {
@@ -204,7 +289,10 @@ function createCodexSession(opts: SessionOpts): AgentSession {
             threadId = r.threadId;
             opts.onThreadId?.(r.threadId);
           }
-          if (r.text) opts.onText?.(r.text);
+          if (r.text) {
+            opts.trace?.(`💬 ${clip(r.text)}`);
+            opts.onText?.(r.text);
+          }
           opts.onTurnEnd?.(r.usage, threadId, queue.size === 0);
         } catch (e) {
           consecErrors++;

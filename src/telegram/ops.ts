@@ -248,7 +248,7 @@ function mediaExtension(media: Message["media"]): string {
     case "voice":
       return ".ogg";
     case "sticker":
-      return ".webp";
+      return media.sourceType === "video" ? ".webm" : media.sourceType === "animated" ? ".tgs" : ".webp";
     case "audio":
     case "document": {
       const fromName = extname(media.fileName ?? "");
@@ -263,11 +263,15 @@ function isViewableImage(media: Message["media"]): boolean {
   if (!media) return false;
   if (media.type === "photo") return true;
   if (media.type === "document") return (media.mimeType ?? "").startsWith("image/");
+  // Статичный стикер — это webp; Anthropic-vision его видит. Анимированные (tgs) и
+  // видео (webm) стикеры как одну картинку не показать.
+  if (media.type === "sticker") return media.sourceType === "static";
   return false;
 }
 
 function imageMime(media: Message["media"]): string {
   if (media?.type === "document" && media.mimeType) return media.mimeType;
+  if (media?.type === "sticker") return "image/webp";
   return "image/jpeg";
 }
 
@@ -302,22 +306,29 @@ export async function getMedia(tg: TelegramClient, chatId: string, messageId: nu
     const bytes = await Bun.file(path).bytes();
     result.image = { base64: Buffer.from(bytes).toString("base64"), mimeType: imageMime(media) };
   } else {
-    result.note = "Не изображение — сохранено на диск; инлайн-просмотр недоступен.";
+    // Нетривиальное медиа (видео, анимированный/видео-стикер, голос, документ) НЕ
+    // показываем инлайн — отдаём ФАЙЛ на диске, а агент сам решает, как его открыть
+    // своими инструментами (Bash: ffmpeg для кадра из видео/анимации, конвертация,
+    // распознавание голоса; затем Read для картинки-результата).
+    const extra = media.type === "sticker" ? ` Стикер (${media.sourceType}), эмодзи ${media.emoji || "—"}.` : "";
+    result.note =
+      `Файл на диске: ${path}. Инлайн-просмотр для этого типа не делаю специально — ` +
+      `открой/пойми его сам своими инструментами (Bash: ffmpeg, конвертация, распознавание; Read для результата).${extra}`;
   }
   return result;
 }
 
-export async function sendFile(tg: TelegramClient, chatId: string, path: string, caption?: string) {
+export async function sendFile(tg: TelegramClient, chatId: string, path: string, caption?: string, replyTo?: number) {
   const peer = await tg.resolvePeer(coercePeer(chatId));
-  await tg.sendMedia(peer, InputMedia.auto(`file:${path}`, caption ? { caption } : {}));
+  await tg.sendMedia(peer, InputMedia.auto(`file:${path}`, caption ? { caption } : {}), replyTo ? { replyTo } : undefined);
   return { chatId, path, ok: true };
 }
 
 /** Отправить изображение именно как ФОТО (сжатое, не документ) — например для BotFather
- *  /setuserpic, который принимает только фото. */
-export async function sendPhoto(tg: TelegramClient, chatId: string, path: string, caption?: string) {
+ *  /setuserpic, который принимает только фото. replyTo — id сообщения/топика форума. */
+export async function sendPhoto(tg: TelegramClient, chatId: string, path: string, caption?: string, replyTo?: number) {
   const peer = await tg.resolvePeer(coercePeer(chatId));
-  await tg.sendMedia(peer, InputMedia.photo(`file:${path}`, caption ? { caption } : {}));
+  await tg.sendMedia(peer, InputMedia.photo(`file:${path}`, caption ? { caption } : {}), replyTo ? { replyTo } : undefined);
   return { chatId, path, ok: true };
 }
 
