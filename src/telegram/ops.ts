@@ -18,7 +18,7 @@ function coercePeer(chatId: string | number): string | number {
 
 // ---------- описание собеседника/чата ----------
 
-export type PeerKind = "user" | "bot" | "group" | "supergroup" | "channel" | "gigagroup" | "monoforum";
+export type PeerKind = "user" | "bot" | "group" | "supergroup" | "channel" | "gigagroup" | "monoforum" | "community";
 
 interface PeerInfo {
   id: number;
@@ -29,7 +29,7 @@ interface PeerInfo {
 function peerInfo(peer: Peer): PeerInfo {
   let kind: PeerKind;
   if (peer.type === "user") kind = peer.isBot ? "bot" : "user";
-  else kind = peer.chatType; // 'group' | 'supergroup' | 'channel' | 'gigagroup' | 'monoforum'
+  else kind = peer.chatType; // 'group' | 'supergroup' | 'channel' | 'gigagroup' | 'monoforum' | 'community'
   return { id: peer.id, name: peer.displayName ?? "", username: peer.username ?? null, kind };
 }
 
