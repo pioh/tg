@@ -1,6 +1,6 @@
 {
   "name": "tg",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -24,7 +24,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.217",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mtcute/bun": "^0.31.0",
     "qrcode-terminal": "^0.12.0",

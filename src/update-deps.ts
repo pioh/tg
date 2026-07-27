@@ -74,6 +74,21 @@ async function notifyOwner(text: string): Promise<void> {
   }
 }
 
+/** Провал с ТАКИМ ЖЕ набором версий уже был? Чтобы не слать владельцу одно и то же
+ *  каждый день, пока апстрим не выпустит рабочую версию (а мы не починим совместимость). */
+async function isNewFailure(which: string, changed: string[]): Promise<boolean> {
+  const path = join(REPO_ROOT, "data", "update-deps-last-failure.json");
+  const sig = `${which}::${changed.slice().sort().join("|")}`;
+  try {
+    const prev = (await Bun.file(path).json()) as { sig?: string };
+    if (prev.sig === sig) return false;
+  } catch {
+    /* нет файла или битый — считаем поломку новой */
+  }
+  await Bun.write(path, JSON.stringify({ sig, at: new Date().toISOString() }, null, 2)).catch(() => {});
+  return true;
+}
+
 async function main(): Promise<void> {
   logLine("старт: bun update --latest (включая мажоры)");
   const before = await versions();
@@ -85,13 +100,15 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Что-то реально поменялось в package.json/bun.lock?
-  const diff = await $`git diff --quiet -- package.json bun.lock`.cwd(REPO_ROOT).nothrow();
-  if (diff.exitCode === 0) {
+  // Что-то реально поменялось? Сверяем УСТАНОВЛЕННЫЕ версии, а не `git diff` против HEAD:
+  // апдейтер не коммитит, поэтому после первого же успешного обновления package.json и
+  // bun.lock остаются «грязными» навсегда → git diff всегда непустой → каждый запуск
+  // впустую гонял проверки, перезапускал сервис и слал владельцу «успех» с пустым списком.
+  const changed = diffVersions(before, await versions());
+  if (changed.length === 0) {
     logLine("изменений нет — уже latest.");
     process.exit(0);
   }
-  const changed = diffVersions(before, await versions());
   logLine("обновлено:\n" + changed.join("\n"));
 
   logLine("проверка: typecheck");
@@ -100,9 +117,10 @@ async function main(): Promise<void> {
   const tt = await $`bun test`.cwd(REPO_ROOT).quiet().nothrow();
 
   if (tc.exitCode === 0 && tt.exitCode === 0) {
+    // Успех владельца не беспокоит: рутинный апдейт — это шум. Всё видно в журнале
+    // (journalctl --user -u tg-update-deps) и в git diff. Уведомляем только о поломках.
     logLine("зелёно — оставляю обновление и перезапускаю сервис.");
     await $`systemctl --user restart tg-agent`.nothrow();
-    await notifyOwner(`✅ Автообновление зависимостей: typecheck + тесты прошли, сервис перезапущен.\n\n${changed.join("\n")}`);
     process.exit(0);
   }
 
@@ -112,7 +130,13 @@ async function main(): Promise<void> {
   logLine(`КРАСНО (${failWhich}) — откатываю (git checkout + bun install).`);
   await $`git checkout -- package.json bun.lock`.cwd(REPO_ROOT).nothrow();
   await $`bun install`.cwd(REPO_ROOT).quiet().nothrow();
-  await notifyOwner(`↩️ Автообновление откатил: сломался ${failWhich}. Зависимости вернул на прежние.\n\nПробовал:\n${changed.join("\n")}`);
+  // Одна и та же поломка каждый день — тоже спам: уведомляем только когда набор версий
+  // отличается от прошлого проваленного апдейта (иначе просто пишем в журнал).
+  if (await isNewFailure(failWhich, changed)) {
+    await notifyOwner(`↩️ Автообновление откатил: сломался ${failWhich}. Зависимости вернул на прежние.\n\nПробовал:\n${changed.join("\n")}`);
+  } else {
+    logLine("та же поломка, что и в прошлый раз — владельца не беспокою.");
+  }
   logLine("откат выполнен. Хвост ошибки:\n" + tail);
   process.exit(2);
 }
