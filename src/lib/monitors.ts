@@ -187,6 +187,15 @@ export interface FiredMonitor {
   messages: MessageLite[];
 }
 
+// id владельца в пределах процесса постоянен — кэшируем, чтобы не звать
+// users.getUsers лишний раз (каждый такой вызов Telegram считает активностью
+// аккаунта и показывает владельца «в сети»).
+let selfIdCache: number | null = null;
+async function selfId(tg: TelegramClient): Promise<number> {
+  if (selfIdCache == null) selfIdCache = (await tg.getMe()).id;
+  return selfIdCache;
+}
+
 /**
  * Оценивает все включённые мониторы. Возвращает только сработавшие (с новыми
  * значимыми сообщениями, прошедшими троттлинг и проверку «владелец молчит»).
@@ -194,8 +203,11 @@ export interface FiredMonitor {
  */
 export async function evaluateMonitors(tg: TelegramClient, nowMs: number): Promise<FiredMonitor[]> {
   const data = await load();
-  if (data.monitors.length === 0) return [];
-  const meId = (await tg.getMe()).id;
+  // Ни одного ВКЛЮЧЁННОГО монитора — выходим сразу, не трогая Telegram API. Раньше
+  // ранний выход срабатывал только на пустом файле, и выключенные мониторы всё равно
+  // заставляли дёргать getMe() на каждом тике детектора (раз в 3с) — из-за этого
+  // аккаунт владельца постоянно светился «в сети».
+  if (!data.monitors.some((m) => m.enabled)) return [];
   const fired: FiredMonitor[] = [];
   let changed = false;
 
@@ -215,6 +227,10 @@ export async function evaluateMonitors(tg: TelegramClient, nowMs: number): Promi
 
     const fresh = [...raw].filter((m) => m.id > mon.lastSeenMessageId).sort((a, b) => a.id - b.id);
     if (fresh.length === 0) continue;
+
+    // id владельца нужен только когда есть новые сообщения; в пределах процесса он
+    // не меняется, поэтому берём его лениво и кэшируем.
+    const meId = await selfId(tg);
 
     // Последнее исходящее (владельца) — для проверки «человек уже ответил».
     let ownerOutgoingMaxDate = 0;
