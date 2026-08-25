@@ -1,6 +1,6 @@
 import "./_env.ts";
 import { test, expect } from "bun:test";
-import { keepAccountOffline } from "../src/telegram/presence.ts";
+import { isWriteMethod, keepAccountOffline } from "../src/telegram/presence.ts";
 
 // Фейковый mtcute-клиент: важна только воронка _client.call.
 function fakeClient() {
@@ -18,16 +18,28 @@ function fakeClient() {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-test("после затишья шлём account.updateStatus(offline)", async () => {
+test("после ДЕЙСТВИЯ (отправки) шлём account.updateStatus(offline)", async () => {
   const { client, calls } = fakeClient();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   expect(keepAccountOffline(client as any, 10)).toBe(true);
 
-  await client._client.call({ _: "users.getUsers" });
-  expect(calls).toEqual(["users.getUsers"]);
+  await client._client.call({ _: "messages.sendMessage" });
+  expect(calls).toEqual(["messages.sendMessage"]);
 
   await wait(40);
-  expect(calls).toEqual(["users.getUsers", "account.updateStatus"]);
+  expect(calls).toEqual(["messages.sendMessage", "account.updateStatus"]);
+});
+
+test("ЧТЕНИЕ статус не трогает — гасить после него не надо", async () => {
+  const { client, calls } = fakeClient();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  keepAccountOffline(client as any, 10);
+
+  await client._client.call({ _: "messages.getHistory" });
+  await client._client.call({ _: "messages.getDialogs" });
+  await client._client.call({ _: "users.getUsers" });
+  await wait(60);
+  expect(calls.filter((c) => c === "account.updateStatus").length).toBe(0);
 });
 
 test("сам updateStatus не перезаводит таймер (нет бесконечного цикла)", async () => {
@@ -35,7 +47,7 @@ test("сам updateStatus не перезаводит таймер (нет бе�
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   keepAccountOffline(client as any, 10);
 
-  await client._client.call({ _: "messages.getHistory" });
+  await client._client.call({ _: "messages.sendMessage" });
   await wait(40);
   const afterFirst = calls.length;
   await wait(40);
@@ -49,7 +61,7 @@ test("пачка запросов гасится ОДНИМ offline после �
   keepAccountOffline(client as any, 20);
 
   for (let i = 0; i < 5; i++) {
-    await client._client.call({ _: "messages.getHistory" });
+    await client._client.call({ _: "messages.sendMessage" });
     await wait(5);
   }
   await wait(60);
@@ -63,34 +75,22 @@ test("TG_KEEP_OFFLINE=0 выключает перехват", async () => {
     const { client, calls } = fakeClient();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(keepAccountOffline(client as any, 10)).toBe(false);
-    await client._client.call({ _: "users.getUsers" });
+    await client._client.call({ _: "messages.sendMessage" });
     await wait(40);
-    expect(calls).toEqual(["users.getUsers"]);
+    expect(calls).toEqual(["messages.sendMessage"]);
   } finally {
     if (prev === undefined) delete process.env.TG_KEEP_OFFLINE;
     else process.env.TG_KEEP_OFFLINE = prev;
   }
 });
 
-test("после (пере)подключения статус гасится по событию соединения", async () => {
-  const calls: string[] = [];
-  let cb: ((s: string) => void) | undefined;
-  const client = {
-    _client: {
-      call: async (req: { _: string }) => {
-        calls.push(req._);
-        return {};
-      },
-      onConnectionState: { add: (fn: (s: string) => void) => void (cb = fn) },
-    },
-  };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  keepAccountOffline(client as any, 10);
-  expect(typeof cb).toBe("function");
-
-  cb!("connected"); // как после реконнекта: своих call() не было
-  await wait(600); // гашение после коннекта идёт с небольшой задержкой (AFTER_CONNECT_MS)
-  expect(calls).toEqual(["account.updateStatus"]);
+test("isWriteMethod: действия отличаются от чтения", () => {
+  for (const m of ["messages.sendMessage", "messages.editMessage", "messages.deleteMessages", "messages.readHistory", "messages.setTyping"]) {
+    expect(isWriteMethod(m)).toBe(true);
+  }
+  for (const m of ["messages.getHistory", "messages.getDialogs", "users.getUsers", "updates.getState", "contacts.resolveUsername", undefined]) {
+    expect(isWriteMethod(m as string)).toBe(false);
+  }
 });
 
 test("TG_OFFLINE_HEARTBEAT_SEC: периодически подтверждаем оффлайн без своих запросов", async () => {

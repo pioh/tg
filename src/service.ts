@@ -18,7 +18,7 @@ import * as botpolicy from "./lib/botpolicy.ts";
 import { checkForUpdate, applyUpdate, currentVersion } from "./lib/update.ts";
 import { managedBy } from "./lib/service-install.ts";
 import { createClient, hasSession } from "./telegram/client.ts";
-import { keepAccountOffline, markOfflineNow, isConnected, lastRpcAt } from "./telegram/presence.ts";
+import { keepAccountOffline, isConnected, lastRpcAt } from "./telegram/presence.ts";
 import * as monitors from "./lib/monitors.ts";
 import { ensureDataLayout, appendProgress } from "./lib/memory.ts";
 import { loadState, updateState, type AgentUsage } from "./lib/state.ts";
@@ -605,7 +605,6 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
         tg = undefined;
         throw new Error(`сессия Telegram недействительна (${e instanceof Error ? e.message : e}); войдите заново: bun run tg login ${ctx.name}`);
       }
-      await markOfflineNow(tg);
     } else {
       lg("Telegram: не подключаюсь (нет включённых мониторов) — аккаунт не светится «в сети»; подключусь при первом запросе");
     }
