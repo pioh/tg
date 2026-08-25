@@ -19,11 +19,17 @@
 import type { TelegramClient } from "@mtcute/bun";
 
 const UPDATE_STATUS = "account.updateStatus";
-const DEFAULT_DELAY_MS = 3000;
+// Гасим статус практически сразу: цель — чтобы контакты не успели увидеть «в сети».
+// Небольшой debounce нужен только чтобы склеить пачку запросов в один updateStatus.
+const DEFAULT_DELAY_MS = Number(process.env.TG_OFFLINE_DEBOUNCE_MS ?? 250);
+// После (пере)подключения mtcute шлёт updates.getState МИМО воронки call (это сетевой
+// слой), поэтому гасим статус ещё и по событию соединения.
+const AFTER_CONNECT_MS = 400;
 
 type RawCall = (...args: unknown[]) => Promise<unknown>;
 interface CallFunnel {
   call: RawCall;
+  onConnectionState?: { add?: (cb: (state: string) => void) => void };
 }
 
 export function keepOfflineDisabled(): boolean {
@@ -66,6 +72,24 @@ export function keepAccountOffline(tg: TelegramClient, delayMs = DEFAULT_DELAY_M
     }
     return res;
   };
+  // Переподключение: mtcute сам шлёт updates.getState в обход воронки call, и Telegram
+  // может засчитать это активностью. Ловим событие соединения и гасим статус.
+  funnel.onConnectionState?.add?.((state: string) => {
+    if (state !== "connected" && state !== "updating") return;
+    const t = setTimeout(goOffline, AFTER_CONNECT_MS);
+    (t as { unref?: () => void }).unref?.();
+  });
+
+  // Жёсткий режим (по желанию владельца): раз в N секунд подтверждаем «оффлайн», даже
+  // если своих запросов не было. Ловит любые всплески, которые прошли мимо воронки.
+  // Побочка: пока режим включён, владелец будет выглядеть оффлайн И когда сам сидит
+  // в Telegram с телефона. Поэтому по умолчанию выключено (0).
+  const hbSec = Number(process.env.TG_OFFLINE_HEARTBEAT_SEC ?? 0);
+  if (Number.isFinite(hbSec) && hbSec > 0) {
+    const iv = setInterval(goOffline, hbSec * 1000);
+    (iv as { unref?: () => void }).unref?.();
+  }
+
   (funnel as { __tgOfflinePatched?: boolean }).__tgOfflinePatched = true;
   return true;
 }

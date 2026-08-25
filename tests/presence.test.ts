@@ -71,3 +71,39 @@ test("TG_KEEP_OFFLINE=0 выключает перехват", async () => {
     else process.env.TG_KEEP_OFFLINE = prev;
   }
 });
+
+test("после (пере)подключения статус гасится по событию соединения", async () => {
+  const calls: string[] = [];
+  let cb: ((s: string) => void) | undefined;
+  const client = {
+    _client: {
+      call: async (req: { _: string }) => {
+        calls.push(req._);
+        return {};
+      },
+      onConnectionState: { add: (fn: (s: string) => void) => void (cb = fn) },
+    },
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  keepAccountOffline(client as any, 10);
+  expect(typeof cb).toBe("function");
+
+  cb!("connected"); // как после реконнекта: своих call() не было
+  await wait(600); // гашение после коннекта идёт с небольшой задержкой (AFTER_CONNECT_MS)
+  expect(calls).toEqual(["account.updateStatus"]);
+});
+
+test("TG_OFFLINE_HEARTBEAT_SEC: периодически подтверждаем оффлайн без своих запросов", async () => {
+  const prev = process.env.TG_OFFLINE_HEARTBEAT_SEC;
+  process.env.TG_OFFLINE_HEARTBEAT_SEC = "0.02"; // 20мс
+  try {
+    const { client, calls } = fakeClient();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    keepAccountOffline(client as any, 10);
+    await wait(90);
+    expect(calls.filter((c) => c === "account.updateStatus").length).toBeGreaterThan(1);
+  } finally {
+    if (prev === undefined) delete process.env.TG_OFFLINE_HEARTBEAT_SEC;
+    else process.env.TG_OFFLINE_HEARTBEAT_SEC = prev;
+  }
+});
