@@ -18,6 +18,7 @@ import * as botpolicy from "./lib/botpolicy.ts";
 import { checkForUpdate, applyUpdate, currentVersion } from "./lib/update.ts";
 import { managedBy } from "./lib/service-install.ts";
 import { createClient, hasSession } from "./telegram/client.ts";
+import { keepAccountOffline, markOfflineNow } from "./telegram/presence.ts";
 import { ensureDataLayout, appendProgress } from "./lib/memory.ts";
 import { loadState, updateState, type AgentUsage } from "./lib/state.ts";
 import { prepareLock, writeLock, releaseLock } from "./lib/lock.ts";
@@ -594,6 +595,12 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
       tg = undefined;
       throw new Error(`сессия Telegram недействительна (${e instanceof Error ? e.message : e}); войдите заново: bun run tg login ${ctx.name}`);
     }
+
+    // Владелец не должен «гореть» в сети из-за работы сервиса: любой RPC Telegram
+    // считает активностью аккаунта. Ставим авто-оффлайн (после затишья шлём
+    // updateStatus(offline)) и сразу гасим статус после подключения/проверки сессии.
+    if (!keepAccountOffline(tg)) lg("присутствие: авто-оффлайн НЕ активирован (выключен через TG_KEEP_OFFLINE или изменились внутренности mtcute)");
+    await markOfflineNow(tg);
 
     // 2) Авторизация ок — берём свободный порт и ПОДГОТАВЛИВАЕМ координаты (без записи
     // lock). Сначала реально поднимаем хаб (он должен слушать порт), и только ПОСЛЕ
