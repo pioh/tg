@@ -2,7 +2,7 @@ import "./_env.ts";
 import { test, expect } from "bun:test";
 import { join } from "node:path";
 import { dataDir } from "../src/lib/paths.ts";
-import { listMonitors, updateMonitor } from "../src/lib/monitors.ts";
+import { hasEnabledMonitors, listMonitors, updateMonitor } from "../src/lib/monitors.ts";
 
 const MON_PATH = join(dataDir(), "monitors.json");
 
@@ -32,4 +32,20 @@ test("updateMonitor может выключить монитор (enabled=false)
   await Bun.write(MON_PATH, JSON.stringify({ monitors: [{ id: "m1", name: "x", chat: "123", action: "notify", enabled: true, lastSeenMessageId: 0 }] }, null, 2));
   const updated = await updateMonitor("m1", { enabled: false });
   expect(updated?.enabled).toBe(false);
+});
+
+test("hasEnabledMonitors: выключенные мониторы не считаются", async () => {
+  await Bun.write(
+    MON_PATH,
+    JSON.stringify({
+      monitors: [
+        { id: "m1", name: "x", chat: "1", action: "notify", enabled: false, lastSeenMessageId: 0 },
+        { id: "m2", name: "y", chat: "2", action: "notify", enabled: false, lastSeenMessageId: 0 },
+      ],
+    }),
+  );
+  expect(await hasEnabledMonitors()).toBe(false);
+
+  await updateMonitor("m2", { enabled: true });
+  expect(await hasEnabledMonitors()).toBe(true);
 });

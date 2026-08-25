@@ -36,6 +36,25 @@ export function keepOfflineDisabled(): boolean {
   return String(process.env.TG_KEEP_OFFLINE ?? "1").trim() === "0";
 }
 
+// Время последнего РЕАЛЬНОГО запроса к Telegram (по воронке call). Нужно сервису, чтобы
+// понять, что активности нет и от аккаунта можно отключиться совсем.
+const lastRpc = new WeakMap<object, number>();
+
+function funnelOf(tg: TelegramClient): CallFunnel | undefined {
+  return (tg as unknown as { _client?: CallFunnel })._client;
+}
+
+/** Момент последнего запроса к Telegram (мс) или 0, если запросов не было. */
+export function lastRpcAt(tg: TelegramClient): number {
+  const f = funnelOf(tg);
+  return f ? (lastRpc.get(f) ?? 0) : 0;
+}
+
+/** Подключён ли клиент к Telegram прямо сейчас. */
+export function isConnected(tg: TelegramClient): boolean {
+  return Boolean((funnelOf(tg) as { isConnected?: boolean } | undefined)?.isConnected);
+}
+
 /**
  * Включает авто-«оффлайн»: после затишья в запросах шлём account.updateStatus(offline).
  * Возвращает true, если перехват встал (false — воронку не нашли или выключено).
@@ -66,6 +85,7 @@ export function keepAccountOffline(tg: TelegramClient, delayMs = DEFAULT_DELAY_M
     const res = origCall(...args);
     // Сам updateStatus активностью не считаем — иначе таймер перезаводил бы сам себя.
     if (method !== UPDATE_STATUS) {
+      lastRpc.set(funnel, Date.now());
       if (timer) clearTimeout(timer);
       timer = setTimeout(goOffline, delayMs);
       (timer as { unref?: () => void }).unref?.();

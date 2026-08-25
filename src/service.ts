@@ -18,7 +18,8 @@ import * as botpolicy from "./lib/botpolicy.ts";
 import { checkForUpdate, applyUpdate, currentVersion } from "./lib/update.ts";
 import { managedBy } from "./lib/service-install.ts";
 import { createClient, hasSession } from "./telegram/client.ts";
-import { keepAccountOffline, markOfflineNow } from "./telegram/presence.ts";
+import { keepAccountOffline, markOfflineNow, isConnected, lastRpcAt } from "./telegram/presence.ts";
+import * as monitors from "./lib/monitors.ts";
 import { ensureDataLayout, appendProgress } from "./lib/memory.ts";
 import { loadState, updateState, type AgentUsage } from "./lib/state.ts";
 import { prepareLock, writeLock, releaseLock } from "./lib/lock.ts";
@@ -584,23 +585,30 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     engine = cfg.agent;
     botUsername = cfg.botUsername;
 
-    // 1) Клиент + проверка авторизации ДО захвата lock/порта.
+    // 1) Клиент. ВАЖНО: в простое к Telegram НЕ подключаемся вовсе.
+    // Требование владельца: «если нет мониторов и я тебя сам не прошу что-то делать,
+    // онлайн сам не должен срабатывать». Любой RPC (и даже коннект, после которого
+    // mtcute шлёт updates.getState) Telegram считает активностью аккаунта. Поэтому:
+    //   - есть включённые мониторы → подключаемся сразу и проверяем сессию (как раньше);
+    //   - мониторов нет → клиент создан, но НЕ подключён: соединение поднимется само при
+    //     первом реальном запросе (mtcute коннектится лениво внутри call()), то есть
+    //     только когда владелец сам что-то попросил.
     tg = await createClient();
-    await tg.connect();
-    let me: { displayName: string };
-    try {
-      me = await tg.getMe();
-    } catch (e) {
-      await tg.destroy().catch(() => {});
-      tg = undefined;
-      throw new Error(`сессия Telegram недействительна (${e instanceof Error ? e.message : e}); войдите заново: bun run tg login ${ctx.name}`);
-    }
-
-    // Владелец не должен «гореть» в сети из-за работы сервиса: любой RPC Telegram
-    // считает активностью аккаунта. Ставим авто-оффлайн (после затишья шлём
-    // updateStatus(offline)) и сразу гасим статус после подключения/проверки сессии.
     if (!keepAccountOffline(tg)) lg("присутствие: авто-оффлайн НЕ активирован (выключен через TG_KEEP_OFFLINE или изменились внутренности mtcute)");
-    await markOfflineNow(tg);
+    let me: { displayName: string } = { displayName: ctx.name };
+    if (await monitors.hasEnabledMonitors()) {
+      await tg.connect();
+      try {
+        me = await tg.getMe();
+      } catch (e) {
+        await tg.destroy().catch(() => {});
+        tg = undefined;
+        throw new Error(`сессия Telegram недействительна (${e instanceof Error ? e.message : e}); войдите заново: bun run tg login ${ctx.name}`);
+      }
+      await markOfflineNow(tg);
+    } else {
+      lg("Telegram: не подключаюсь (нет включённых мониторов) — аккаунт не светится «в сети»; подключусь при первом запросе");
+    }
 
     // 2) Авторизация ок — берём свободный порт и ПОДГОТАВЛИВАЕМ координаты (без записи
     // lock). Сначала реально поднимаем хаб (он должен слушать порт), и только ПОСЛЕ
@@ -650,6 +658,28 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
           await detect();
         } catch (e) {
           lg("детектор:", e instanceof Error ? e.message : e);
+        }
+      }
+    })();
+    // авто-отключение от Telegram в простое: если включённых мониторов нет и владелец
+    // ничего не просил N секунд — рвём соединение совсем. Тогда аккаунт гарантированно
+    // не «горит» в сети сам по себе (даже реконнекты mtcute не случаются). При первом
+    // же запросе mtcute подключится обратно автоматически.
+    (async () => {
+      const idleSec = Number(process.env.TG_IDLE_DISCONNECT_SEC ?? 120);
+      if (!(idleSec > 0)) return;
+      while (!stopping && !globalStopping) {
+        await sleep(15000);
+        try {
+          if (!tg || !isConnected(tg)) continue;
+          if (inflight > 0) continue; // агент прямо сейчас работает
+          if (await monitors.hasEnabledMonitors()) continue;
+          const last = lastRpcAt(tg);
+          if (last && Date.now() - last < idleSec * 1000) continue;
+          await tg.disconnect();
+          lg("Telegram: отключился в простое (нет включённых мониторов) — аккаунт не светится «в сети»");
+        } catch (e) {
+          lg("авто-отключение:", e instanceof Error ? e.message : e);
         }
       }
     })();

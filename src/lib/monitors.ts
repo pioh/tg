@@ -142,6 +142,12 @@ export async function listMonitors(): Promise<Monitor[]> {
   return (await load()).monitors;
 }
 
+/** Есть ли хоть один ВКЛЮЧЁННЫЙ монитор. Только диск, Telegram не трогаем: по этому
+ *  флагу сервис решает, держать ли вообще связь с аккаунтом владельца. */
+export async function hasEnabledMonitors(): Promise<boolean> {
+  return (await load()).monitors.some((m) => m.enabled);
+}
+
 export async function removeMonitor(id: string): Promise<boolean> {
   const data = await load();
   const before = data.monitors.length;
