@@ -325,6 +325,12 @@ function createCodexSession(opts: SessionOpts): AgentSession {
   };
 }
 
+/** Сессии для resume больше нет: Claude Code удаляет транскрипты старше cleanupPeriodDays
+ *  (по умолчанию 30 дней простоя). Повторять resume бессмысленно — нужна новая сессия. */
+export function isSessionGoneError(err: unknown): boolean {
+  return err instanceof Error && /no conversation found with session id/i.test(err.message);
+}
+
 export function createAgentSession(opts: SessionOpts): AgentSession {
   return opts.engine === "codex" ? createCodexSession(opts) : createClaudeSession(opts);
 }

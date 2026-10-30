@@ -25,7 +25,7 @@ import { loadState, updateState, type AgentUsage } from "./lib/state.ts";
 import { prepareLock, writeLock, releaseLock } from "./lib/lock.ts";
 import { buildHandlers, startHubServer, type Handlers, type AgentSessionCtx } from "./hub.ts";
 import { buildSystemAppend } from "./agent/prompt.ts";
-import { createAgentSession, type AgentSession, type TurnUsage } from "./agent/session.ts";
+import { createAgentSession, isSessionGoneError, type AgentSession, type TurnUsage } from "./agent/session.ts";
 import { log, fail } from "./lib/log.ts";
 import { type TenantContext } from "./lib/paths.ts";
 import { autoMigrateLegacy, listTenants, tenantContext, withTenant } from "./lib/tenants.ts";
@@ -197,6 +197,9 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   let resetRequested = false;
   // Буфер событий на время пересоздания/рестарта сессии (с целью ответа).
   let pendingBuffer: { obj: unknown; target: ReplyTarget | undefined }[] = [];
+  // События, отданные текущей сессии до её первого завершённого хода. Если её resume
+  // провалился (транскрипт удалён), она их не обработала — переигрываем в новую сессию.
+  let unconfirmed: { obj: unknown; target: ReplyTarget | undefined }[] = [];
   let applying = false;
 
   // FIFO целей ответа: на каждое запушенное событие — чат, КУДА уйдёт текст этого хода.
@@ -250,6 +253,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   async function startSession(resume?: string): Promise<void> {
     const append = await buildSystemAppend();
     needIntro = true;
+    unconfirmed = [];
     agentSessionId = resume;
     session = createAgentSession({
       engine,
@@ -273,6 +277,8 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
 
   async function restart(resume: string | undefined, fresh: boolean): Promise<void> {
     await session?.close();
+    crashStopped = false; // ручной перезапуск (/new, /effort) оживляет остановленную сессию
+    crashCount = 0;
     if (fresh) {
       agentUsage = freshUsage();
       codexThreadId = undefined;
@@ -284,6 +290,23 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
   async function onSessionError(err: unknown): Promise<void> {
     if (stopping || globalStopping || restarting || crashStopped) return;
     restarting = true;
+    if (isSessionGoneError(err)) {
+      // Это не падение: сбой постоянный, watchdog только зря исчерпал бы попытки и остановил
+      // агента навсегда. Контекст сессии потерян, но память агента — на диске.
+      lg(`сессия ${agentSessionId?.slice(0, 8)} больше недоступна (транскрипт удалён) — начинаю новую`);
+      const lost = unconfirmed;
+      inflight = 0;
+      replyTargets = [];
+      pendingBuffer = [...lost, ...pendingBuffer];
+      try {
+        await restart(undefined, true);
+      } finally {
+        restarting = false;
+      }
+      await handlers?.bot_send?.({ text: "♻️ Прежняя сессия агента устарела и удалена — начал новую. Память и handoff на месте." }).catch(() => {});
+      replayBuffer();
+      return;
+    }
     const now = Date.now();
     if (now - lastCrashTs > 60000) crashCount = 0;
     lastCrashTs = now;
@@ -312,6 +335,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
 
   function onTurnEnd(usage: TurnUsage, sessionId: string | undefined, queueEmpty: boolean): void {
     if (sessionId) agentSessionId = sessionId;
+    unconfirmed = [];
     agentUsage = {
       turns: agentUsage.turns + 1,
       contextTokens: usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens,
@@ -375,6 +399,7 @@ function createTenantRuntime(ctx: TenantContext): TenantRuntime {
     }
     inflight++;
     replyTargets.push(target);
+    unconfirmed.push({ obj, target });
     const head = needIntro ? LIVE_INTRO + "\nСОБЫТИЕ:\n" : "Новое событие:\n";
     needIntro = false;
     session!.push(head + JSON.stringify(obj, null, 2));
