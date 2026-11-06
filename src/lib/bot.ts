@@ -201,8 +201,13 @@ function applyInline(escaped: string): string {
   // слов и умножение (5*5, process_user_data) остаются буквальными.
   s = applyEmphasis(s);
 
-  // Возвращаем вынутые код/ссылки на место.
-  s = s.replace(/(\d+)/g, (_m, i: string) => stash[Number(i)]!);
+  // Возвращаем вынутые код/ссылки на место. В цикле: ссылка может содержать плейсхолдер
+  // инлайн-кода ([`foo`](url)), который раскрывается только после самой ссылки.
+  const ph = /(\d+)/g;
+  while (ph.test(s)) {
+    ph.lastIndex = 0;
+    s = s.replace(ph, (_m, i: string) => stash[Number(i)]!);
+  }
   return s;
 }
 

@@ -140,3 +140,12 @@ test("незакрытый одиночный * остаётся букваль�
     "незакрытый *курсив без пары",
   );
 });
+
+test("инлайн-код внутри текста ссылки не превращается в плейсхолдер", () => {
+  expect(mdToTelegramHtml("[`foo`](https://example.com)")).toBe(
+    '<a href="https://example.com"><code>foo</code></a>',
+  );
+  expect(mdToTelegramHtml("см. [файл `bot.ts`](https://x.y/a) и `код`")).toBe(
+    'см. <a href="https://x.y/a">файл <code>bot.ts</code></a> и <code>код</code>',
+  );
+});
